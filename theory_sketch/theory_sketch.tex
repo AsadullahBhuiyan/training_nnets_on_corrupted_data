@@ -1,0 +1,91 @@
+% Minimal theory sketch for MNIST corruption experiment.
+\documentclass[11pt]{article}
+\usepackage{amsmath, amssymb}
+\usepackage{geometry}
+\geometry{margin=1in}
+
+\title{Sketch: Accuracy vs. Corruption Probability in Pixel Replacement}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section*{Setup}
+Let $x \in [0,1]^d$ be an input image and $y \in \{1,\dots,10\}$ the label.
+We define a corruption operator $\mathcal{C}_p$ that independently replaces each pixel with
+probability $p$:
+\[
+(\mathcal{C}_p(x))_i =
+\begin{cases}
+u_i, & \text{with probability } p,\\
+x_i, & \text{with probability } 1-p,
+\end{cases}
+\quad u_i \sim \mathrm{Uniform}(0,1).
+\]
+Training uses corrupted inputs $\tilde{x} = \mathcal{C}_p(x)$ and clean labels $y$.
+We study the test accuracy $A(p)$ of a network trained at corruption strength $p$.
+
+\section*{Corruption as Attenuation + Noise}
+Let $M_i \sim \mathrm{Bernoulli}(p)$ and $u_i \sim \mathrm{Uniform}(0,1)$, independent. Then
+\[
+\tilde{x} = (1-M) \odot x + M \odot u.
+\]
+Conditioned on $x$,
+\[
+\mathbb{E}[\tilde{x}\mid x] = (1-p) x + \tfrac{p}{2}\mathbf{1}, \quad
+\mathrm{Var}(\tilde{x}_i \mid x) = p(1-p)(x_i - \tfrac{1}{2})^2 + \tfrac{p}{12}.
+\]
+So corruption both shrinks the signal by $(1-p)$ and injects noise of scale $\sqrt{p}$.
+
+For a generic scalar score function $s(x)$ (e.g., a logit margin), a first-order expansion gives
+\[
+s(\tilde{x}) \approx s(x) + \nabla_x s(x)^\top (\tilde{x} - x).
+\]
+This is a local but exact linearization of the trained network. The gradient
+$g(x) = \nabla_x s(x)$ is a measurable sensitivity vector.
+
+\section*{Margin Criterion for a Sharp Drop}
+Define the margin for example $(x,y)$ as
+\[
+\gamma(x) = f_y(x) - \max_{k\ne y} f_k(x),
+\]
+where $f_k$ is the logit for class $k$. A sufficient condition for label flip is
+$\gamma(\tilde{x}) < 0$. Using the linearization above,
+\[
+\Delta \gamma \approx g(x)^\top (\tilde{x} - x).
+\]
+Because the corruption is iid across pixels, $\Delta \gamma$ concentrates with variance
+\[
+\mathrm{Var}(\Delta \gamma \mid x) \approx \sum_i g_i(x)^2 \, \mathrm{Var}(\tilde{x}_i \mid x).
+\]
+This suggests a threshold when typical fluctuations match the clean margin:
+\[
+\gamma(x) \approx c \, \sqrt{\mathrm{Var}(\Delta \gamma \mid x)}.
+\]
+Aggregating over the data distribution yields a population-level crossover $p^\star$.
+As model size increases, the margin distribution can shift and sharpen, causing a steeper
+drop in accuracy as $p$ passes $p^\star$.
+
+\section*{Finite-Size Scaling Hypothesis}
+Let $A(p)$ be the test accuracy when training with corruption $p$. We hypothesize:
+\begin{itemize}
+  \item \textbf{Shift:} the midpoint $p^\star$ of the accuracy drop increases with model size
+  or data size, reflecting improved margins.
+  \item \textbf{Sharpening:} the slope $|A'(p^\star)|$ increases with size, producing an
+  apparently ``critical'' knee.
+  \item \textbf{Collapse:} when plotted against an effective SNR proxy (e.g.,
+  $(1-p)/\sqrt{p}$ or a measured margin-to-noise ratio), curves for different sizes align.
+\end{itemize}
+This is a finite-size crossover that can mimic a phase transition in the large-system limit.
+
+\section*{Testable Predictions}
+\begin{enumerate}
+  \item Fit $A(p)$ with a sigmoid to estimate $p^\star$ and the slope; study scaling vs. width.
+  \item Compute $g(x)=\nabla_x \gamma(x)$ on a held-out set; test whether
+  $\gamma(x)/\sqrt{\mathrm{Var}(\Delta \gamma \mid x)}$ predicts failures.
+  \item Compare MLP vs. CNN: CNNs should tolerate larger $p^\star$ due to inductive bias.
+  \item Test curve collapse using an empirical SNR proxy derived from margins and gradients.
+\end{enumerate}
+
+\end{document}
