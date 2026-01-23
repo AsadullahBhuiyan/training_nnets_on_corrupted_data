@@ -31,6 +31,7 @@ def summarize_runs(rows: list[dict]) -> list[dict]:
     summary_rows: list[dict] = []
     for (activation, model_type, p), items in grouped.items():
         accs = [float(r["test_accuracy"]) for r in items]
+        losses = [float(r["test_loss"]) for r in items]
         summary_rows.append(
             {
                 "activation": activation,
@@ -40,6 +41,11 @@ def summarize_runs(rows: list[dict]) -> list[dict]:
                 "mean_test_accuracy": statistics.mean(accs),
                 "std_test_accuracy": statistics.pstdev(accs) if len(accs) > 1 else 0.0,
                 "stderr_test_accuracy": (statistics.pstdev(accs) / (len(items) ** 0.5))
+                if len(items) > 1
+                else 0.0,
+                "mean_test_loss": statistics.mean(losses),
+                "std_test_loss": statistics.pstdev(losses) if len(losses) > 1 else 0.0,
+                "stderr_test_loss": (statistics.pstdev(losses) / (len(items) ** 0.5))
                 if len(items) > 1
                 else 0.0,
             }
@@ -76,6 +82,25 @@ def write_summary_pdf(path: str, summary_rows: list[dict], metadata: dict) -> No
             pdf.savefig(fig)
             plt.close(fig)
 
+            fig, axes = plt.subplots(1, n, figsize=(4 * n, 3), sharey=True)
+            if n == 1:
+                axes = [axes]
+            for ax, act in zip(axes, activations):
+                d = sub[sub["activation"] == act].sort_values("p")
+                ax.errorbar(
+                    d["p"],
+                    d["mean_test_loss"],
+                    yerr=d["stderr_test_loss"],
+                    marker="o",
+                )
+                ax.set_title(f"{model_type} / {act}")
+                ax.set_xlabel("p")
+                ax.grid(True, alpha=0.3)
+            axes[0].set_ylabel("mean test loss")
+            plt.tight_layout()
+            pdf.savefig(fig)
+            plt.close(fig)
+
         table_df = df.sort_values(["model_type", "activation", "p"]).copy()
         table_df["p"] = table_df["p"].map(lambda v: f"{v:.3f}")
         table_df["mean_test_accuracy"] = table_df["mean_test_accuracy"].map(lambda v: f"{v:.4f}")
@@ -85,11 +110,11 @@ def write_summary_pdf(path: str, summary_rows: list[dict], metadata: dict) -> No
         fig = plt.figure(figsize=(11, 8.5))
         ax = fig.add_subplot(111)
         ax.axis("off")
-        ax.set_title("Results Summary", fontweight="bold")
+        fig.text(0.5, 0.96, "Results Summary", ha="center", va="top", fontweight="bold")
         table = ax.table(
             cellText=table_df.values,
             colLabels=table_df.columns,
-            loc="center",
+            bbox=[0.0, 0.0, 1.0, 0.9],
             cellLoc="center",
         )
         table.auto_set_font_size(False)
@@ -124,7 +149,7 @@ def main() -> None:
     batch_size = 128
     learning_rate = 1e-3
     weight_decay = 0.0
-    max_workers = 50
+    max_workers = 10
     data_workers = 2
     cpu_threads_per_worker = 1
     output_dir = "results"
