@@ -12,6 +12,7 @@ pandas
 matplotlib
 jupyter
 tqdm
+scikit-learn
 ```
 
 Pip alternative:
@@ -24,4 +25,5 @@ pandas
 matplotlib
 jupyter
 tqdm
+scikit-learn
 ```
