@@ -13,19 +13,13 @@ import pandas as pd
 import numpy as np
 import torch
 from tqdm import tqdm
-from sklearn.neural_network import BernoulliRBM
-from sklearn.linear_model import LogisticRegression
-from sklearn.pipeline import Pipeline
-from sklearn.metrics import log_loss
-
 from nnet_models import (
     TrainConfig,
     build_model,
     get_dataloaders,
     evaluate,
     apply_corruption,
-    apply_corruption_numpy,
-    load_mnist_numpy,
+    compute_loss,
 )
 
 
@@ -209,6 +203,7 @@ def main() -> None:
     batch_size = 128
     learning_rate = 1e-3
     weight_decay = 0.0
+    loss_type = "cross_entropy"  # options: "cross_entropy", "quadratic"
     mlp_width = 256
     mlp_depth = 2
     data_workers = 2
@@ -248,7 +243,7 @@ def main() -> None:
         width_tag = f"w{mlp_width}" if model_type == "mlp" else model_type
         return (
             f"{model_type}_r{corruption_trials}_e{epochs}_tf{test_fraction:.3f}_"
-            f"{strength_tag}_{width_tag}_d{mlp_depth}"
+            f"{strength_tag}_{width_tag}_d{mlp_depth}_loss-{loss_type}"
         )
 
     for activation in activations:
@@ -264,6 +259,7 @@ def main() -> None:
             batch_size=batch_size,
             learning_rate=learning_rate,
             weight_decay=weight_decay,
+            loss_type=loss_type,
             seed=1234,
             num_workers=data_workers,
             cpu_threads=1,
@@ -281,96 +277,58 @@ def main() -> None:
             f"{suffix_note} (activation={activation})"
         )
 
-        if cfg.model_type.lower() == "rbm":
-            x_train, y_train, x_test, y_test = load_mnist_numpy(
-                brightness_scale=cfg.brightness_scale,
-                max_train_samples=cfg.max_train_samples,
-            )
-            x_train = apply_corruption_numpy(
-                x_train, cfg.corruption_mode, cfg.p, cfg.sigma
-            )
-            rbm = BernoulliRBM(
-                n_components=cfg.rbm_components,
-                learning_rate=cfg.rbm_learning_rate,
-                batch_size=cfg.rbm_batch_size,
-                n_iter=cfg.rbm_n_iter,
-                random_state=cfg.seed,
-                verbose=False,
-            )
-            clf = LogisticRegression(
-                max_iter=cfg.rbm_classifier_max_iter,
-                n_jobs=1,
-                multi_class="auto",
-            )
-            model = Pipeline([("rbm", rbm), ("logreg", clf)])
-            model.fit(x_train, y_train)
-            probs = model.predict_proba(x_test)
-            preds = probs.argmax(axis=1)
-            clean_acc = float((preds == y_test).mean())
-            clean_loss = float(log_loss(y_test, probs))
-            print(f"[rbm] clean test accuracy: {clean_acc:.4f} (loss={clean_loss:.4f})")
+        train_loader, test_loader = get_dataloaders(
+            batch_size=cfg.batch_size,
+            p=cfg.p,
+            num_workers=cfg.num_workers,
+            max_train_samples=cfg.max_train_samples,
+            corruption_mode=cfg.corruption_mode,
+            sigma=cfg.sigma,
+            brightness_scale=cfg.brightness_scale,
+            custom_split=cfg.custom_split,
+            test_fraction=cfg.test_fraction,
+            split_seed=cfg.split_seed,
+            split_source=cfg.split_source,
+        )
+        model = build_model(cfg.model_type, cfg.activation).to(device)
+        optimizer = torch.optim.Adam(
+            model.parameters(),
+            lr=cfg.learning_rate,
+            weight_decay=cfg.weight_decay,
+        )
 
-            def _eval_rbm(p_val: float, sigma_val: float) -> tuple[float, float, float]:
-                accs = []
-                for _ in range(corruption_trials):
-                    x_corrupt = apply_corruption_numpy(
-                        x_test, cfg.corruption_mode, p_val, sigma_val
-                    )
-                    preds_local = model.predict(x_corrupt)
-                    accs.append(float((preds_local == y_test).mean()))
-                mean_acc = statistics.mean(accs)
-                std_acc = statistics.pstdev(accs) if len(accs) > 1 else 0.0
-                stderr_acc = std_acc / (len(accs) ** 0.5) if len(accs) > 1 else 0.0
-                return mean_acc, std_acc, stderr_acc
-        else:
-            train_loader, test_loader = get_dataloaders(
-                batch_size=cfg.batch_size,
-                p=cfg.p,
-                num_workers=cfg.num_workers,
-                max_train_samples=cfg.max_train_samples,
-            )
-            model = build_model(cfg.model_type, cfg.activation).to(device)
-            optimizer = torch.optim.Adam(
-                model.parameters(),
-                lr=cfg.learning_rate,
-                weight_decay=cfg.weight_decay,
-            )
+        for _ in tqdm(range(cfg.epochs), desc=f"epochs ({activation})", unit="epoch"):
+            model.train()
+            for x, y in train_loader:
+                x = x.to(device)
+                y = y.to(device)
+                optimizer.zero_grad(set_to_none=True)
+                logits = model(x)
+                loss = compute_loss(logits, y, loss_type)
+                loss.backward()
+                optimizer.step()
 
-            for _ in tqdm(range(cfg.epochs), desc=f"epochs ({activation})", unit="epoch"):
-                model.train()
-                for x, y in train_loader:
-                    x = x.to(device)
-                    y = y.to(device)
-                    optimizer.zero_grad(set_to_none=True)
-                    logits = model(x)
-                    loss = torch.nn.functional.cross_entropy(logits, y)
-                    loss.backward()
-                    optimizer.step()
-
-            clean_loss, clean_acc = evaluate(model, test_loader, device)
-            print(f"[{activation}] clean test accuracy: {clean_acc:.4f} (loss={clean_loss:.4f})")
+        clean_loss, clean_acc = evaluate(model, test_loader, device, loss_type)
+        print(f"[{activation}] clean test accuracy: {clean_acc:.4f} (loss={clean_loss:.4f})")
 
         for value in tqdm(sweep_values, desc=f"{sweep_label} sweep{suffix_note} ({activation})", unit="s"):
             p = value if corruption_mode == "replacement" else 0.0
             sigma = value if corruption_mode == "additive" else 0.0
-            if cfg.model_type.lower() == "rbm":
-                mean_acc, std_acc, stderr_acc = _eval_rbm(p, sigma)
-            else:
-                mean_acc, std_acc, stderr_acc = evaluate_with_corruption_parallel(
-                    model=model,
-                    model_type=model_type,
-                    activation=activation,
-                    batch_size=batch_size,
-                    num_workers=data_workers,
-                    cpu_threads=cpu_threads_per_worker,
-                    max_train_samples=max_train_samples,
-                    corruption_mode=corruption_mode,
-                    p=p,
-                    sigma=sigma,
-                    trials=corruption_trials,
-                    max_workers=max_workers,
-                    cpu_cores=cpu_cores,
-                )
+            mean_acc, std_acc, stderr_acc = evaluate_with_corruption_parallel(
+                model=model,
+                model_type=model_type,
+                activation=activation,
+                batch_size=batch_size,
+                num_workers=data_workers,
+                cpu_threads=cpu_threads_per_worker,
+                max_train_samples=max_train_samples,
+                corruption_mode=corruption_mode,
+                p=p,
+                sigma=sigma,
+                trials=corruption_trials,
+                max_workers=max_workers,
+                cpu_cores=cpu_cores,
+            )
             summary_rows.append(
                 {
                     "activation": activation,
@@ -440,6 +398,7 @@ def main() -> None:
             "batch_size": batch_size,
             "learning_rate": learning_rate,
             "weight_decay": weight_decay,
+            "loss_type": loss_type,
             "mlp_width": mlp_width,
             "mlp_depth": mlp_depth,
             "data_workers": data_workers,

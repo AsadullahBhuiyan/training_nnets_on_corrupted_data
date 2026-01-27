@@ -7,6 +7,7 @@ from typing import Iterable, Tuple
 import numpy as np
 import torch
 from torch import nn
+from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset
 from torchvision import datasets, transforms
 from tqdm import tqdm
@@ -28,6 +29,7 @@ class TrainConfig:
     seed: int
     num_workers: int
     corruption_mode: str = "replacement"
+    loss_type: str = "cross_entropy"  # options: "cross_entropy", "quadratic"
     sigma: float = 0.0
     mlp_hidden_sizes: list[int] | None = None
     custom_split: bool = False
@@ -70,6 +72,17 @@ def get_activation(name: str) -> nn.Module:
     if name == "gelu":
         return nn.GELU()
     raise ValueError(f"Unsupported activation: {name}")
+
+
+def compute_loss(logits: torch.Tensor, targets: torch.Tensor, loss_type: str) -> torch.Tensor:
+    loss_type = loss_type.lower()
+    if loss_type == "cross_entropy":
+        return F.cross_entropy(logits, targets)
+    if loss_type == "quadratic":
+        probs = torch.softmax(logits, dim=1)
+        one_hot = F.one_hot(targets, num_classes=logits.size(1)).float()
+        return torch.mean((probs - one_hot) ** 2)
+    raise ValueError(f"Unsupported loss_type: {loss_type}")
 
 
 MLP_HIDDEN_SIZES = (256, 256)
@@ -311,25 +324,29 @@ def train_one_epoch(
     loader: DataLoader,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
+    loss_type: str,
 ) -> float:
     model.train()
     total_loss = 0.0
-    criterion = nn.CrossEntropyLoss()
     for x, y in loader:
         x = x.to(device)
         y = y.to(device)
         optimizer.zero_grad(set_to_none=True)
         logits = model(x)
-        loss = criterion(logits, y)
+        loss = compute_loss(logits, y, loss_type)
         loss.backward()
         optimizer.step()
         total_loss += loss.item() * x.size(0)
     return total_loss / len(loader.dataset)
 
 
-def evaluate(model: nn.Module, loader: DataLoader, device: torch.device) -> Tuple[float, float]:
+def evaluate(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    loss_type: str = "cross_entropy",
+) -> Tuple[float, float]:
     model.eval()
-    criterion = nn.CrossEntropyLoss()
     total_loss = 0.0
     correct = 0
     with torch.no_grad():
@@ -337,7 +354,7 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device) -> Tupl
             x = x.to(device)
             y = y.to(device)
             logits = model(x)
-            loss = criterion(logits, y)
+            loss = compute_loss(logits, y, loss_type)
             total_loss += loss.item() * x.size(0)
             preds = logits.argmax(dim=1)
             correct += (preds == y).sum().item()
@@ -440,9 +457,9 @@ def train_and_evaluate(cfg: TrainConfig) -> dict:
         leave=False,
         disable=cfg.epochs <= 1,
     ):
-        last_train_loss = train_one_epoch(model, train_loader, optimizer, device)
+        last_train_loss = train_one_epoch(model, train_loader, optimizer, device, cfg.loss_type)
 
-    test_loss, test_acc = evaluate(model, test_loader, device)
+    test_loss, test_acc = evaluate(model, test_loader, device, cfg.loss_type)
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(
         f"[{timestamp}] done: model={cfg.model_type} act={cfg.activation} "

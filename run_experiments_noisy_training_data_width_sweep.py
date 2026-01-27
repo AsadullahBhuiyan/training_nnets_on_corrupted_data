@@ -196,6 +196,7 @@ def build_cache_key(
     repeats: int,
     epochs: int,
     test_fraction: float,
+    loss_type: str,
     corruption_mode: str,
     ps: list[float],
     sigmas: list[float],
@@ -209,7 +210,10 @@ def build_cache_key(
         s_min, s_max = min(sigmas), max(sigmas)
         strength_tag = f"s{s_min:.2f}-{s_max:.2f}"
     w_min, w_max = min(widths), max(widths)
-    return f"mlpws_r{repeats}_e{epochs}_tf{test_fraction:.3f}_{strength_tag}_w{w_min}-{w_max}_d{mlp_depth}"
+    return (
+        f"mlpws_r{repeats}_e{epochs}_tf{test_fraction:.3f}_"
+        f"{strength_tag}_w{w_min}-{w_max}_d{mlp_depth}_loss-{loss_type}"
+    )
 
 
 def main() -> None:
@@ -227,6 +231,7 @@ def main() -> None:
     batch_size = 128
     learning_rate = 1e-3
     weight_decay = 0.0
+    loss_type = "cross_entropy"  # options: "cross_entropy", "quadratic"
     max_workers = cpu_max
     data_workers = 0
     cpu_threads_per_worker = 1
@@ -273,6 +278,7 @@ def main() -> None:
                                 batch_size=batch_size,
                                 learning_rate=learning_rate,
                                 weight_decay=weight_decay,
+                                loss_type=loss_type,
                                 seed=run_seed,
                                 num_workers=data_workers,
                                 cpu_threads=cpu_threads_per_worker,
@@ -322,6 +328,7 @@ def main() -> None:
         repeats=repeats,
         epochs=epochs,
         test_fraction=test_fraction,
+        loss_type=loss_type,
         corruption_mode=corruption_mode,
         ps=ps,
         sigmas=sigmas,
@@ -350,6 +357,7 @@ def main() -> None:
         "batch_size": batch_size,
         "learning_rate": learning_rate,
         "weight_decay": weight_decay,
+        "loss_type": loss_type,
         "max_workers": max_workers,
         "data_workers": data_workers,
         "cpu_threads_per_worker": cpu_threads_per_worker,

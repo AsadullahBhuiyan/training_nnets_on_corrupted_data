@@ -1,8 +1,9 @@
 import os
-os.environ.setdefault("OMP_NUM_THREADS", "1")
-os.environ.setdefault("MKL_NUM_THREADS", "1")
-os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
-os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+max_cpu = 20
+os.environ.setdefault("OMP_NUM_THREADS", str(max_cpu))
+os.environ.setdefault("MKL_NUM_THREADS", str(max_cpu))
+os.environ.setdefault("OPENBLAS_NUM_THREADS", str(max_cpu))
+os.environ.setdefault("NUMEXPR_NUM_THREADS", str(max_cpu))
 
 import csv
 import random
@@ -176,6 +177,7 @@ def build_cache_key(
     repeats: int,
     epochs: int,
     test_fraction: float,
+    loss_type: str,
     corruption_mode: str,
     ps: list[float],
     sigmas: list[float],
@@ -191,14 +193,17 @@ def build_cache_key(
         s_min, s_max = min(sigmas), max(sigmas)
         strength_tag = f"s{s_min:.2f}-{s_max:.2f}"
     width_tag = f"w{mlp_width}" if not width_sweep else f"w{mlp_width}"
-    return f"{model_tag}_r{repeats}_e{epochs}_tf{test_fraction:.3f}_{strength_tag}_{width_tag}_d{mlp_depth}"
+    return (
+        f"{model_tag}_r{repeats}_e{epochs}_tf{test_fraction:.3f}_"
+        f"{strength_tag}_{width_tag}_d{mlp_depth}_loss-{loss_type}"
+    )
 
 
 def main() -> None:
     start_time = datetime.now()
     # Manual configuration (edit these values directly).
     activations = ["relu", "tanh", "sigmoid", "gelu"]
-    model_types = ["rbm"]  # options: "mlp", "cnn", "rbm"
+    model_types = ["mlp"]  # options: "mlp", "cnn"
     corruption_mode = "replacement"  # options: "replacement", "additive"
     #ps = np.linspace(0.8, 1.0, 21)
     ps = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
@@ -208,24 +213,20 @@ def main() -> None:
     batch_size = 128
     learning_rate = 1e-3
     weight_decay = 0.0
-    mlp_width = 256
-    mlp_depth = 2
-    rbm_components = 256
-    rbm_learning_rate = 0.01
-    rbm_batch_size = 128
-    rbm_n_iter = 20
-    rbm_classifier_max_iter = 1000
-    max_workers = 10
-    data_workers = 2
+    loss_type = "cross_entropy"  # options: "cross_entropy", "quadratic"
+    mlp_width = 128
+    mlp_depth = 1
+    max_workers = max_cpu
+    data_workers = 1
     cpu_threads_per_worker = 1
-    cpu_cores = None  # Example: [0, 1, 2, 3] to pin processes.
+    cpu_cores = list(range(max_cpu))  # Example: [0, 1, 2, 3] to pin processes.
     brightness_scale = 1.0
     custom_split = False
     test_fraction = 0.2
     split_seed = 1234
     split_source = "train"
     output_dir = "results"
-    suffix = 'rbm'
+    suffix = None
     seed = 1234
     max_train_samples = None
     use_cuda = False
@@ -262,11 +263,7 @@ def main() -> None:
                             batch_size=batch_size,
                             learning_rate=learning_rate,
                             weight_decay=weight_decay,
-                            rbm_components=rbm_components,
-                            rbm_learning_rate=rbm_learning_rate,
-                            rbm_batch_size=rbm_batch_size,
-                            rbm_n_iter=rbm_n_iter,
-                            rbm_classifier_max_iter=rbm_classifier_max_iter,
+                            loss_type=loss_type,
                             seed=run_seed,
                             num_workers=data_workers,
                             cpu_threads=cpu_threads_per_worker,
@@ -317,6 +314,7 @@ def main() -> None:
         repeats=repeats,
         epochs=epochs,
         test_fraction=test_fraction,
+        loss_type=loss_type,
         corruption_mode=corruption_mode,
         ps=ps,
         sigmas=sigmas,
@@ -345,13 +343,9 @@ def main() -> None:
         "batch_size": batch_size,
         "learning_rate": learning_rate,
         "weight_decay": weight_decay,
+        "loss_type": loss_type,
         "mlp_width": mlp_width,
         "mlp_depth": mlp_depth,
-        "rbm_components": rbm_components,
-        "rbm_learning_rate": rbm_learning_rate,
-        "rbm_batch_size": rbm_batch_size,
-        "rbm_n_iter": rbm_n_iter,
-        "rbm_classifier_max_iter": rbm_classifier_max_iter,
         "max_workers": max_workers,
         "data_workers": data_workers,
         "cpu_threads_per_worker": cpu_threads_per_worker,
