@@ -1,15 +1,14 @@
 import os
-cpu_max = 40
-os.environ.setdefault("OMP_NUM_THREADS", str(cpu_max))
-os.environ.setdefault("MKL_NUM_THREADS", str(cpu_max))
-os.environ.setdefault("OPENBLAS_NUM_THREADS", str(cpu_max))
-os.environ.setdefault("NUMEXPR_NUM_THREADS", str(cpu_max))
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
 import csv
 import random
 import statistics
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import numpy as np
 
 import matplotlib.pyplot as plt
@@ -32,19 +31,19 @@ def write_csv(path: str, rows: list[dict]) -> None:
 def summarize_runs(rows: list[dict]) -> list[dict]:
     grouped: dict[tuple[str, str, str, float, float, int], list[dict]] = {}
     for row in rows:
-        width = int(row["mlp_hidden_sizes"][0]) if row["mlp_hidden_sizes"] else -1
+        depth = len(row["mlp_hidden_sizes"]) if row["mlp_hidden_sizes"] else 0
         key = (
             row["activation"],
             row["model_type"],
             row["corruption_mode"],
             float(row["p"]),
             float(row["sigma"]),
-            width,
+            depth,
         )
         grouped.setdefault(key, []).append(row)
 
     summary_rows: list[dict] = []
-    for (activation, model_type, corruption_mode, p, sigma, width), items in grouped.items():
+    for (activation, model_type, corruption_mode, p, sigma, depth), items in grouped.items():
         accs = [float(r["test_accuracy"]) for r in items]
         losses = [float(r["test_loss"]) for r in items]
         summary_rows.append(
@@ -54,7 +53,7 @@ def summarize_runs(rows: list[dict]) -> list[dict]:
                 "corruption_mode": corruption_mode,
                 "p": p,
                 "sigma": sigma,
-                "mlp_width": width,
+                "mlp_depth": depth,
                 "repeats": len(items),
                 "mean_test_accuracy": statistics.mean(accs),
                 "std_test_accuracy": statistics.pstdev(accs) if len(accs) > 1 else 0.0,
@@ -73,7 +72,7 @@ def summarize_runs(rows: list[dict]) -> list[dict]:
             r["model_type"],
             r["activation"],
             r["corruption_mode"],
-            r["mlp_width"],
+            r["mlp_depth"],
             r["p"],
             r["sigma"],
         )
@@ -104,6 +103,30 @@ def _init_worker(cores: list[int] | None) -> None:
         pass
 
 
+def build_cache_key(
+    repeats: int,
+    epochs: int,
+    test_fraction: float,
+    corruption_mode: str,
+    ps: list[float],
+    sigmas: list[float],
+    width: int,
+    depths: list[int],
+    loss_type: str,
+) -> str:
+    if corruption_mode == "replacement":
+        p_min, p_max = min(ps), max(ps)
+        strength_tag = f"p{p_min:.2f}-{p_max:.2f}"
+    else:
+        s_min, s_max = min(sigmas), max(sigmas)
+        strength_tag = f"s{s_min:.2f}-{s_max:.2f}"
+    d_min, d_max = min(depths), max(depths)
+    return (
+        f"mlpds_r{repeats}_e{epochs}_tf{test_fraction:.3f}_"
+        f"{strength_tag}_w{width}_d{d_min}-{d_max}_loss-{loss_type}"
+    )
+
+
 def write_summary_pdf(path: str, summary_rows: list[dict], metadata: dict) -> None:
     df = pd.DataFrame(summary_rows)
     model_types = sorted(df["model_type"].unique())
@@ -112,7 +135,7 @@ def write_summary_pdf(path: str, summary_rows: list[dict], metadata: dict) -> No
         for model_type in model_types:
             sub = df[df["model_type"] == model_type]
             activations = sorted(sub["activation"].unique())
-            widths = sorted(sub["mlp_width"].unique())
+            depths = sorted(sub["mlp_depth"].unique())
             corruption_modes = sub["corruption_mode"].unique()
             sweep_label = "sigma" if len(corruption_modes) == 1 and corruption_modes[0] == "additive" else "p"
             n = len(activations)
@@ -121,8 +144,8 @@ def write_summary_pdf(path: str, summary_rows: list[dict], metadata: dict) -> No
             if n == 1:
                 axes = [axes]
             for ax, act in zip(axes, activations):
-                for width in widths:
-                    d = sub[(sub["activation"] == act) & (sub["mlp_width"] == width)].sort_values(
+                for depth in depths:
+                    d = sub[(sub["activation"] == act) & (sub["mlp_depth"] == depth)].sort_values(
                         sweep_label
                     )
                     ax.errorbar(
@@ -130,7 +153,7 @@ def write_summary_pdf(path: str, summary_rows: list[dict], metadata: dict) -> No
                         d["mean_test_accuracy"],
                         yerr=d["stderr_test_accuracy"],
                         marker="o",
-                        label=f"w={width}",
+                        label=f"d={depth}",
                     )
                 ax.set_title(f"{model_type} / {act}")
                 ax.set_xlabel(sweep_label)
@@ -145,8 +168,8 @@ def write_summary_pdf(path: str, summary_rows: list[dict], metadata: dict) -> No
             if n == 1:
                 axes = [axes]
             for ax, act in zip(axes, activations):
-                for width in widths:
-                    d = sub[(sub["activation"] == act) & (sub["mlp_width"] == width)].sort_values(
+                for depth in depths:
+                    d = sub[(sub["activation"] == act) & (sub["mlp_depth"] == depth)].sort_values(
                         sweep_label
                     )
                     ax.errorbar(
@@ -154,7 +177,7 @@ def write_summary_pdf(path: str, summary_rows: list[dict], metadata: dict) -> No
                         d["mean_test_loss"],
                         yerr=d["stderr_test_loss"],
                         marker="o",
-                        label=f"w={width}",
+                        label=f"d={depth}",
                     )
                 ax.set_title(f"{model_type} / {act}")
                 ax.set_xlabel(sweep_label)
@@ -169,11 +192,11 @@ def write_summary_pdf(path: str, summary_rows: list[dict], metadata: dict) -> No
             if n == 1:
                 axes = [axes]
             for ax, act in zip(axes, activations):
-                for width in widths:
-                    d = sub[(sub["activation"] == act) & (sub["mlp_width"] == width)].sort_values(
+                for depth in depths:
+                    d = sub[(sub["activation"] == act) & (sub["mlp_depth"] == depth)].sort_values(
                         sweep_label
                     )
-                    ax.plot(d[sweep_label], d["std_test_accuracy"], marker="o", label=f"w={width}")
+                    ax.plot(d[sweep_label], d["std_test_accuracy"], marker="o", label=f"d={depth}")
                 ax.set_title(f"{model_type} / {act}")
                 ax.set_xlabel(sweep_label)
                 ax.grid(True, alpha=0.3)
@@ -186,63 +209,39 @@ def write_summary_pdf(path: str, summary_rows: list[dict], metadata: dict) -> No
         meta_lines = [f"{key}: {value}" for key, value in metadata.items()]
         fig = plt.figure(figsize=(8.5, 11))
         fig.text(0.05, 0.95, "Run Metadata", fontsize=14, fontweight="bold", va="top")
-        fig.text(0.05, 0.9, "\n".join(meta_lines), fontsize=10, va="top")
+        fig.text(0.05, 0.9, "\\n".join(meta_lines), fontsize=10, va="top")
         plt.axis("off")
         pdf.savefig(fig)
         plt.close(fig)
 
 
-def build_cache_key(
-    repeats: int,
-    epochs: int,
-    test_fraction: float,
-    loss_type: str,
-    corruption_mode: str,
-    ps: list[float],
-    sigmas: list[float],
-    widths: list[int],
-    mlp_depth: int,
-) -> str:
-    if corruption_mode == "replacement":
-        p_min, p_max = min(ps), max(ps)
-        strength_tag = f"p{p_min:.2f}-{p_max:.2f}"
-    else:
-        s_min, s_max = min(sigmas), max(sigmas)
-        strength_tag = f"s{s_min:.2f}-{s_max:.2f}"
-    w_min, w_max = min(widths), max(widths)
-    return (
-        f"mlpws_r{repeats}_e{epochs}_tf{test_fraction:.3f}_"
-        f"{strength_tag}_w{w_min}-{w_max}_d{mlp_depth}_loss-{loss_type}"
-    )
-
-
 def main() -> None:
     start_time = datetime.now()
     # Manual configuration (edit these values directly).
-    activations = ["relu"]
-    model_types = ["mlp"]  # width sweep is MLP-only
+    activations = ["relu", "tanh", "sigmoid", "gelu"]
+    model_types = ["mlp"]
     corruption_mode = "replacement"  # options: "replacement", "additive"
-    ps = np.linspace(0.85, 1.0, 21)
+    ps = np.linspace(0.8, 1.0, 21)
     sigmas = [0.0, 0.1, 0.2, 0.4, 0.6, 0.8, 1.0]
-    widths = [64, 256, 1024]
-    mlp_depth = 1
-    repeats = 100
-    epochs = 20
+    width = 256
+    depths = [1, 2, 3, 4]
+    repeats = 50
+    epochs = 10
     batch_size = 128
     learning_rate = 1e-3
     weight_decay = 0.0
     loss_type = "cross_entropy"  # options: "cross_entropy", "quadratic"
-    max_workers = cpu_max
+    max_workers = 8
     data_workers = 0
     cpu_threads_per_worker = 1
-    cpu_cores = list(range(cpu_max))  # Example: [0, 1, 2, 3] to pin processes.
+    cpu_cores = None  # Example: [0, 1, 2, 3] to pin processes.
     brightness_scale = 1.0
     custom_split = False
-    test_fraction = 1/2
+    test_fraction = 0.2
     split_seed = 1234
     split_source = "train"
     output_dir = "results"
-    suffix = 'relu_only'
+    suffix = "depth_sweep"
     seed = 1234
     max_train_samples = None
     use_cuda = False
@@ -260,10 +259,11 @@ def main() -> None:
     configs: list[TrainConfig] = []
     for activation in activations:
         for model_type in model_types:
-            for width in widths:
+            for depth in depths:
                 for value in sweep_values:
                     p = value if corruption_mode == "replacement" else 0.0
                     sigma = value if corruption_mode == "additive" else 0.0
+                    mlp_hidden_sizes = [width] * depth
                     for _ in range(repeats):
                         run_seed = random.randint(1, 1_000_000_000)
                         configs.append(
@@ -273,7 +273,7 @@ def main() -> None:
                                 corruption_mode=corruption_mode,
                                 p=p,
                                 sigma=sigma,
-                                mlp_hidden_sizes=[width] * mlp_depth,
+                                mlp_hidden_sizes=mlp_hidden_sizes,
                                 epochs=epochs,
                                 batch_size=batch_size,
                                 learning_rate=learning_rate,
@@ -296,8 +296,7 @@ def main() -> None:
     suffix_tag = f"_{suffix}" if suffix else ""
     suffix_note = f" (suffix={suffix})" if suffix else ""
     print(
-        f"[{timestamp}] Launching {len(configs)} runs with max_workers={max_workers}..."
-        f"{suffix_note}"
+        f"[{timestamp}] Launching {len(configs)} runs with max_workers={max_workers}..." f"{suffix_note}"
     )
 
     results: list[dict] = []
@@ -308,7 +307,7 @@ def main() -> None:
         initargs=(cpu_cores,),
     ) as executor:
         futures = [executor.submit(train_and_evaluate, cfg) for cfg in configs]
-        desc = f"Runs{suffix_note} (widths={widths})"
+        desc = f"Runs{suffix_note} (depths={depths})"
         for future in tqdm(as_completed(futures), total=len(futures), desc=desc, unit="run"):
             res = future.result()
             results.append(res)
@@ -318,22 +317,22 @@ def main() -> None:
                 timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 print(f"[{timestamp}] new {sweep_label} encountered: {strength_value:.3f}")
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            width = res["mlp_hidden_sizes"][0] if res["mlp_hidden_sizes"] else -1
+            depth = len(res["mlp_hidden_sizes"]) if res["mlp_hidden_sizes"] else 0
             print(
                 f"[{timestamp}] done: model={res['model_type']} act={res['activation']} "
-                f"{sweep_label}={strength_value:.3f} width={width} acc={res['test_accuracy']:.4f}"
+                f"{sweep_label}={strength_value:.3f} depth={depth} acc={res['test_accuracy']:.4f}"
             )
 
     cache_key = build_cache_key(
         repeats=repeats,
         epochs=epochs,
         test_fraction=test_fraction,
-        loss_type=loss_type,
         corruption_mode=corruption_mode,
         ps=ps,
         sigmas=sigmas,
-        widths=widths,
-        mlp_depth=mlp_depth,
+        width=width,
+        depths=depths,
+        loss_type=loss_type,
     )
     per_run_path = os.path.join(output_dir, f"results_per_run_{cache_key}{suffix_tag}.csv")
     summary_path = os.path.join(output_dir, f"results_summary_{cache_key}{suffix_tag}.csv")
@@ -350,8 +349,8 @@ def main() -> None:
         "corruption_mode": corruption_mode,
         "ps": ps,
         "sigmas": sigmas,
-        "widths": widths,
-        "mlp_depth": mlp_depth,
+        "width": width,
+        "depths": depths,
         "repeats": repeats,
         "epochs": epochs,
         "batch_size": batch_size,
