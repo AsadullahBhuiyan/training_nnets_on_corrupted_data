@@ -4,6 +4,9 @@ os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 import statistics
+import csv
+import random
+import math
 from datetime import datetime
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
@@ -19,6 +22,7 @@ from nnet_models import (
     get_dataloaders,
     evaluate,
     apply_corruption,
+    compute_empirical_ntk,
     compute_loss,
 )
 
@@ -42,6 +46,34 @@ def _init_worker(cores: list[int] | None) -> None:
         torch.set_num_interop_threads(1)
     except Exception:
         pass
+
+
+def ntk_effective_rank(eigvals: np.ndarray) -> float:
+    eigvals = np.maximum(eigvals, 0.0)
+    total = eigvals.sum()
+    if total <= 0:
+        return 0.0
+    probs = eigvals / total
+    entropy = -float(np.sum(probs * np.log(probs + 1e-12)))
+    return float(np.exp(entropy))
+
+
+def ntk_spectral_entropy(eigvals: np.ndarray) -> float:
+    eigvals = np.maximum(eigvals, 0.0)
+    total = eigvals.sum()
+    if total <= 0:
+        return 0.0
+    probs = eigvals / total
+    return float(-np.sum(probs * np.log(probs + 1e-12)))
+
+
+def append_runtime_log(path: str, row: dict) -> None:
+    exists = os.path.exists(path)
+    with open(path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(row.keys()))
+        if not exists:
+            writer.writeheader()
+        writer.writerow(row)
 
 
 def evaluate_with_corruption(
@@ -192,6 +224,7 @@ def evaluate_with_corruption_parallel(
 
 
 def main() -> None:
+    start_time = datetime.now()
     # Manual configuration (edit these values directly).
     activations = ["relu", "tanh", "sigmoid", "gelu"]
     model_type = "cnn"  # options: "mlp", "cnn"
@@ -211,6 +244,13 @@ def main() -> None:
     cpu_threads_per_worker = 1
     cpu_cores = None  # Example: [0, 1, 2, 3] to pin processes.
     max_train_samples = None
+    ntk_compute = True
+    ntk_subset_size = 64
+    ntk_output = "true"  # options: "true", "all"
+    ntk_trials_per_p = 10
+    ntk_hist_ps = [0.0, 0.5, 1.0]
+    ntk_seed = 1234
+    ntk_show_progress = True
     use_cuda = False
     custom_split = False
     test_fraction = 0.2
@@ -311,6 +351,18 @@ def main() -> None:
         clean_loss, clean_acc = evaluate(model, test_loader, device, loss_type)
         print(f"[{activation}] clean test accuracy: {clean_acc:.4f} (loss={clean_loss:.4f})")
 
+        ntk_subset = None
+        if ntk_compute:
+            rng = random.Random(ntk_seed)
+            indices = list(range(len(test_loader.dataset)))
+            rng.shuffle(indices)
+            subset = torch.utils.data.Subset(test_loader.dataset, indices[:ntk_subset_size])
+            ntk_subset = torch.utils.data.DataLoader(
+                subset,
+                batch_size=min(32, ntk_subset_size),
+                shuffle=False,
+            )
+
         for value in tqdm(sweep_values, desc=f"{sweep_label} sweep{suffix_note} ({activation})", unit="s"):
             p = value if corruption_mode == "replacement" else 0.0
             sigma = value if corruption_mode == "additive" else 0.0
@@ -329,6 +381,36 @@ def main() -> None:
                 max_workers=max_workers,
                 cpu_cores=cpu_cores,
             )
+            ntk_ranks = []
+            ntk_entropies = []
+            ntk_eigvals_runs = []
+            if ntk_compute and ntk_subset is not None:
+                for t in range(ntk_trials_per_p):
+                    torch.manual_seed(ntk_seed + t + int(p * 1000))
+                    _, eigvals = compute_empirical_ntk(
+                        model=model,
+                        loader=ntk_subset,
+                        device=device,
+                        max_samples=ntk_subset_size,
+                        output_mode=ntk_output,
+                        corruption_mode=corruption_mode,
+                        p=p,
+                        sigma=sigma,
+                        use_corruption=True,
+                        show_progress=ntk_show_progress,
+                        progress_desc=f"ntk {activation} p={p:.2f}",
+                    )
+                    if eigvals.size > 0:
+                        ntk_ranks.append(ntk_effective_rank(eigvals))
+                        ntk_entropies.append(ntk_spectral_entropy(eigvals))
+                        if value in ntk_hist_ps:
+                            ntk_eigvals_runs.append(eigvals.tolist())
+            mean_ntk_rank = statistics.mean(ntk_ranks) if ntk_ranks else math.nan
+            std_ntk_rank = statistics.pstdev(ntk_ranks) if len(ntk_ranks) > 1 else 0.0
+            stderr_ntk_rank = std_ntk_rank / (len(ntk_ranks) ** 0.5) if len(ntk_ranks) > 1 else 0.0
+            mean_ntk_entropy = statistics.mean(ntk_entropies) if ntk_entropies else math.nan
+            std_ntk_entropy = statistics.pstdev(ntk_entropies) if len(ntk_entropies) > 1 else 0.0
+            stderr_ntk_entropy = std_ntk_entropy / (len(ntk_entropies) ** 0.5) if len(ntk_entropies) > 1 else 0.0
             summary_rows.append(
                 {
                     "activation": activation,
@@ -340,6 +422,13 @@ def main() -> None:
                     "mean_test_accuracy": mean_acc,
                     "std_test_accuracy": std_acc,
                     "stderr_test_accuracy": stderr_acc,
+                    "mean_ntk_rank": mean_ntk_rank,
+                    "std_ntk_rank": std_ntk_rank,
+                    "stderr_ntk_rank": stderr_ntk_rank,
+                    "mean_ntk_entropy": mean_ntk_entropy,
+                    "std_ntk_entropy": std_ntk_entropy,
+                    "stderr_ntk_entropy": stderr_ntk_entropy,
+                    "ntk_eigvals_runs": ntk_eigvals_runs if ntk_eigvals_runs else None,
                 }
             )
             print(
@@ -386,6 +475,75 @@ def main() -> None:
         pdf.savefig(fig)
         plt.close(fig)
 
+        if any(not math.isnan(row.get("mean_ntk_rank", math.nan)) for row in summary_rows):
+            fig, axes = plt.subplots(1, n, figsize=(4 * n, 3), sharey=True)
+            if n == 1:
+                axes = [axes]
+            for ax, act in zip(axes, activations):
+                sub = [row for row in summary_rows if row["activation"] == act]
+                sub = sorted(sub, key=lambda r: r[sweep_label])
+                ps_sorted = [row[sweep_label] for row in sub]
+                means = [row["mean_ntk_rank"] for row in sub]
+                stderrs = [row["stderr_ntk_rank"] for row in sub]
+                ax.errorbar(ps_sorted, means, yerr=stderrs, marker="o")
+                ax.set_title(f"{model_type} / {act} NTK rank")
+                ax.set_xlabel(sweep_label)
+                ax.grid(True, alpha=0.3)
+            axes[0].set_ylabel("mean NTK effective rank")
+            plt.tight_layout()
+            pdf.savefig(fig)
+            plt.close(fig)
+
+        if any(not math.isnan(row.get("mean_ntk_entropy", math.nan)) for row in summary_rows):
+            fig, axes = plt.subplots(1, n, figsize=(4 * n, 3), sharey=True)
+            if n == 1:
+                axes = [axes]
+            for ax, act in zip(axes, activations):
+                sub = [row for row in summary_rows if row["activation"] == act]
+                sub = sorted(sub, key=lambda r: r[sweep_label])
+                ps_sorted = [row[sweep_label] for row in sub]
+                means = [row["mean_ntk_entropy"] for row in sub]
+                stderrs = [row["stderr_ntk_entropy"] for row in sub]
+                ax.errorbar(ps_sorted, means, yerr=stderrs, marker="o")
+                ax.set_title(f"{model_type} / {act} NTK entropy")
+                ax.set_xlabel(sweep_label)
+                ax.grid(True, alpha=0.3)
+            axes[0].set_ylabel("mean NTK spectral entropy")
+            plt.tight_layout()
+            pdf.savefig(fig)
+            plt.close(fig)
+
+        if ntk_compute:
+            for act in activations:
+                fig, axes = plt.subplots(1, len(ntk_hist_ps), figsize=(4 * len(ntk_hist_ps), 3), sharey=True)
+                if len(ntk_hist_ps) == 1:
+                    axes = [axes]
+                for ax, p_val in zip(axes, ntk_hist_ps):
+                    rows = [
+                        row for row in summary_rows
+                        if row["activation"] == act and abs(row["p"] - p_val) < 1e-9
+                    ]
+                    eigvals_runs = []
+                    for row in rows:
+                        ev = row.get("ntk_eigvals_runs")
+                        if ev:
+                            eigvals_runs.extend(ev)
+                    if eigvals_runs:
+                        pooled = np.concatenate([np.array(ev, dtype=float) for ev in eigvals_runs])
+                        pooled = np.maximum(pooled, 0.0)
+                        total = pooled.sum()
+                        pooled = pooled / total if total > 0 else pooled
+                        counts, bins = np.histogram(pooled, bins=30, density=True)
+                        centers = 0.5 * (bins[:-1] + bins[1:])
+                        ax.plot(centers, counts)
+                    ax.set_title(f"{act} p={p_val:.2f}")
+                    ax.set_xlabel("eigenvalue")
+                    ax.grid(True, alpha=0.3)
+                axes[0].set_ylabel("density")
+                plt.tight_layout()
+                pdf.savefig(fig)
+                plt.close(fig)
+
         metadata = {
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "activations": activations,
@@ -405,6 +563,13 @@ def main() -> None:
             "max_workers": max_workers,
             "cpu_threads_per_worker": cpu_threads_per_worker,
             "cpu_cores": cpu_cores,
+            "ntk_compute": ntk_compute,
+            "ntk_subset_size": ntk_subset_size,
+            "ntk_output": ntk_output,
+            "ntk_trials_per_p": ntk_trials_per_p,
+            "ntk_hist_ps": ntk_hist_ps,
+            "ntk_seed": ntk_seed,
+            "ntk_show_progress": ntk_show_progress,
             "custom_split": custom_split,
             "test_fraction": test_fraction,
             "split_seed": split_seed,
@@ -429,6 +594,42 @@ def main() -> None:
         plt.close(fig)
 
     print(f"Saved PDF: {pdf_path}")
+    if ntk_compute:
+        eigvals = []
+        ps_list = []
+        acts_list = []
+        for row in summary_rows:
+            ev_runs = row.get("ntk_eigvals_runs")
+            if ev_runs:
+                for ev in ev_runs:
+                    eigvals.append(ev)
+                    ps_list.append(row["p"])
+                    acts_list.append(row["activation"])
+        if eigvals:
+            ntk_npz_path = os.path.join(output_dir, f"ntk_eigvals_{build_cache_key()}{suffix_tag}.npz")
+            np.savez(
+                ntk_npz_path,
+                eigvals=np.array(eigvals, dtype=object),
+                p=np.array(ps_list, dtype=float),
+                activation=np.array(acts_list, dtype=object),
+            )
+            print(f"Saved NTK eigvals: {ntk_npz_path}")
+
+    elapsed = datetime.now() - start_time
+    script_name = os.path.splitext(os.path.basename(__file__))[0]
+    runtime_log_path = os.path.join(output_dir, f"runtime_log_{script_name}.csv")
+    append_runtime_log(
+        runtime_log_path,
+        {
+            "timestamp_start": start_time.strftime("%Y-%m-%d %H:%M:%S"),
+            "timestamp_end": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "elapsed_seconds": int(elapsed.total_seconds()),
+            "script": "run_experiments_noisy_testing_data.py",
+            "cache_key": build_cache_key(),
+            "output_dir": output_dir,
+            "total_runs": len(summary_rows),
+        },
+    )
 
 
 if __name__ == "__main__":

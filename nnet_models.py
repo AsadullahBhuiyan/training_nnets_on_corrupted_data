@@ -45,6 +45,12 @@ class TrainConfig:
     rbm_classifier_max_iter: int = 1000
     max_train_samples: int | None = None
     use_cuda: bool = False
+    ntk_compute: bool = False
+    ntk_subset_size: int = 64
+    ntk_output: str = "true"  # options: "true", "all"
+    ntk_use_corrupted_inputs: bool = True
+    ntk_seed: int = 1234
+    ntk_show_progress: bool = False
 
 
 def set_seed(seed: int) -> None:
@@ -83,6 +89,76 @@ def compute_loss(logits: torch.Tensor, targets: torch.Tensor, loss_type: str) ->
         one_hot = F.one_hot(targets, num_classes=logits.size(1)).float()
         return torch.mean((probs - one_hot) ** 2)
     raise ValueError(f"Unsupported loss_type: {loss_type}")
+
+
+def compute_empirical_ntk(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    max_samples: int,
+    output_mode: str,
+    corruption_mode: str,
+    p: float,
+    sigma: float,
+    use_corruption: bool,
+    show_progress: bool = False,
+    progress_desc: str = "ntk",
+) -> tuple[np.ndarray, np.ndarray]:
+    model.eval()
+    grads = []
+    samples = 0
+    output_mode = output_mode.lower()
+    pbar = None
+    if show_progress:
+        pbar = tqdm(total=max_samples, desc=f"{progress_desc} grads", leave=False)
+
+    for x, y in loader:
+        x = x.to(device)
+        y = y.to(device)
+        if use_corruption:
+            x = apply_corruption(x, corruption_mode, p, sigma)
+        for i in range(x.size(0)):
+            if samples >= max_samples:
+                break
+            xi = x[i : i + 1]
+            yi = y[i : i + 1]
+            logits = model(xi)
+            if output_mode == "true":
+                out = logits[0, yi.item()]
+                grad = torch.autograd.grad(out, model.parameters(), retain_graph=False)
+                flat = torch.cat([g.reshape(-1) for g in grad])
+                grads.append(flat.detach().cpu())
+            elif output_mode == "all":
+                per_class = []
+                for c in range(logits.size(1)):
+                    out = logits[0, c]
+                    grad = torch.autograd.grad(out, model.parameters(), retain_graph=False)
+                    flat = torch.cat([g.reshape(-1) for g in grad])
+                    per_class.append(flat.detach().cpu())
+                grads.append(torch.cat(per_class))
+            else:
+                raise ValueError(f"Unsupported ntk_output: {output_mode}")
+            samples += 1
+            if pbar is not None:
+                pbar.update(1)
+        if samples >= max_samples:
+            break
+    if pbar is not None:
+        pbar.close()
+
+    if not grads:
+        return np.array([]), np.array([])
+
+    G = torch.stack(grads)  # [N, P] or [N, P*C]
+    K = (G @ G.t()).numpy()
+    eig_pbar = None
+    if show_progress:
+        eig_pbar = tqdm(total=1, desc=f"{progress_desc} eig", leave=False)
+    eigvals = np.linalg.eigvalsh(K)
+    if eig_pbar is not None:
+        eig_pbar.update(1)
+        eig_pbar.close()
+    return K, eigvals
 
 
 MLP_HIDDEN_SIZES = (256, 256)
@@ -460,6 +536,38 @@ def train_and_evaluate(cfg: TrainConfig) -> dict:
         last_train_loss = train_one_epoch(model, train_loader, optimizer, device, cfg.loss_type)
 
     test_loss, test_acc = evaluate(model, test_loader, device, cfg.loss_type)
+    ntk_rank = math.nan
+    ntk_trace = math.nan
+    ntk_entropy = math.nan
+    ntk_eigvals = None
+    if cfg.ntk_compute:
+        rng = random.Random(cfg.ntk_seed)
+        indices = list(range(len(test_loader.dataset)))
+        rng.shuffle(indices)
+        subset = torch.utils.data.Subset(test_loader.dataset, indices[: cfg.ntk_subset_size])
+        ntk_loader = DataLoader(subset, batch_size=min(32, cfg.ntk_subset_size), shuffle=False)
+        _, eigvals = compute_empirical_ntk(
+            model=model,
+            loader=ntk_loader,
+            device=device,
+            max_samples=cfg.ntk_subset_size,
+            output_mode=cfg.ntk_output,
+            corruption_mode=cfg.corruption_mode,
+            p=cfg.p,
+            sigma=cfg.sigma,
+            use_corruption=cfg.ntk_use_corrupted_inputs,
+            show_progress=cfg.ntk_show_progress,
+            progress_desc=f"ntk {cfg.activation} w={width_label} {strength_name}={strength_label:.2f}",
+        )
+        if eigvals.size > 0:
+            eigvals = np.maximum(eigvals, 0.0)
+            ntk_trace = float(eigvals.sum())
+            probs = eigvals / ntk_trace if ntk_trace > 0 else eigvals
+            entropy = -float(np.sum(probs * np.log(probs + 1e-12)))
+            ntk_entropy = float(entropy)
+            ntk_rank = float(np.exp(entropy))
+            ntk_eigvals = eigvals.tolist()
+
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(
         f"[{timestamp}] done: model={cfg.model_type} act={cfg.activation} "
@@ -477,4 +585,8 @@ def train_and_evaluate(cfg: TrainConfig) -> dict:
         "test_accuracy": test_acc,
         "brightness_scale": cfg.brightness_scale,
         "mlp_hidden_sizes": cfg.mlp_hidden_sizes,
+        "ntk_rank": ntk_rank,
+        "ntk_trace": ntk_trace,
+        "ntk_entropy": ntk_entropy,
+        "ntk_eigvals": ntk_eigvals,
     }

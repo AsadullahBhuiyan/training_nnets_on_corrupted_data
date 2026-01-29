@@ -5,6 +5,7 @@ os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
 import statistics
+import csv
 from datetime import datetime
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
@@ -35,6 +36,15 @@ def apply_cpu_affinity(cores: list[int] | None) -> None:
         print("CPU affinity is not supported on this platform.")
     except OSError as exc:
         print(f"Failed to set CPU affinity to {cores}: {exc}")
+
+
+def append_runtime_log(path: str, row: dict) -> None:
+    exists = os.path.exists(path)
+    with open(path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(row.keys()))
+        if not exists:
+            writer.writeheader()
+        writer.writerow(row)
 
 
 def _init_worker(cores: list[int] | None) -> None:
@@ -200,6 +210,7 @@ def build_cache_key(
 
 
 def main() -> None:
+    start_time = datetime.now()
     # Manual configuration (edit these values directly).
     activations = ["relu", "tanh", "sigmoid", "gelu"]
     model_type = "mlp"
@@ -442,6 +453,22 @@ def main() -> None:
         plt.close(fig)
 
     print(f"Saved PDF: {pdf_path}")
+
+    elapsed = datetime.now() - start_time
+    script_name = os.path.splitext(os.path.basename(__file__))[0]
+    runtime_log_path = os.path.join(output_dir, f"runtime_log_{script_name}.csv")
+    append_runtime_log(
+        runtime_log_path,
+        {
+            "timestamp_start": start_time.strftime("%Y-%m-%d %H:%M:%S"),
+            "timestamp_end": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "elapsed_seconds": int(elapsed.total_seconds()),
+            "script": "run_experiments_noisy_testing_data_depth_sweep.py",
+            "cache_key": cache_key,
+            "output_dir": output_dir,
+            "total_runs": len(summary_rows),
+        },
+    )
 
 
 if __name__ == "__main__":

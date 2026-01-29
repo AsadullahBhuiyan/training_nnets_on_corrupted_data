@@ -5,6 +5,7 @@ os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
 import statistics
+import csv
 from datetime import datetime
 import numpy as np
 import pandas as pd
@@ -32,6 +33,15 @@ def apply_cpu_affinity(cores: list[int] | None) -> None:
         print(f"Failed to set CPU affinity to {cores}: {exc}")
 
 
+def append_runtime_log(path: str, row: dict) -> None:
+    exists = os.path.exists(path)
+    with open(path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(row.keys()))
+        if not exists:
+            writer.writeheader()
+        writer.writerow(row)
+
+
 def build_cache_key(
     corruption_trials: int,
     test_fraction: float,
@@ -51,6 +61,7 @@ def build_cache_key(
 
 
 def main() -> None:
+    start_time = datetime.now()
     # Manual configuration (edit these values directly).
     corruption_mode = "replacement"  # options: "replacement", "additive"
     ps = np.linspace(0.8, 1.0, 21)
@@ -208,6 +219,22 @@ def main() -> None:
         plt.close(fig)
 
     print(f"Saved PDF: {pdf_path}")
+
+    elapsed = datetime.now() - start_time
+    script_name = os.path.splitext(os.path.basename(__file__))[0]
+    runtime_log_path = os.path.join(output_dir, f"runtime_log_{script_name}.csv")
+    append_runtime_log(
+        runtime_log_path,
+        {
+            "timestamp_start": start_time.strftime("%Y-%m-%d %H:%M:%S"),
+            "timestamp_end": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "elapsed_seconds": int(elapsed.total_seconds()),
+            "script": "run_experiments_rbm_testing_data.py",
+            "cache_key": cache_key,
+            "output_dir": output_dir,
+            "total_runs": len(summary_rows),
+        },
+    )
 
 
 if __name__ == "__main__":

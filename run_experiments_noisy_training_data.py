@@ -44,6 +44,7 @@ def summarize_runs(rows: list[dict]) -> list[dict]:
     for (activation, model_type, corruption_mode, p, sigma), items in grouped.items():
         accs = [float(r["test_accuracy"]) for r in items]
         losses = [float(r["test_loss"]) for r in items]
+        train_losses = [float(r.get("train_loss", 0.0)) for r in items]
         summary_rows.append(
             {
                 "activation": activation,
@@ -62,12 +63,26 @@ def summarize_runs(rows: list[dict]) -> list[dict]:
                 "stderr_test_loss": (statistics.pstdev(losses) / (len(items) ** 0.5))
                 if len(items) > 1
                 else 0.0,
+                "mean_train_loss": statistics.mean(train_losses),
+                "std_train_loss": statistics.pstdev(train_losses) if len(train_losses) > 1 else 0.0,
+                "stderr_train_loss": (statistics.pstdev(train_losses) / (len(items) ** 0.5))
+                if len(items) > 1
+                else 0.0,
             }
         )
     summary_rows.sort(
         key=lambda r: (r["model_type"], r["activation"], r["corruption_mode"], r["p"], r["sigma"])
     )
     return summary_rows
+
+
+def append_runtime_log(path: str, row: dict) -> None:
+    exists = os.path.exists(path)
+    with open(path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(row.keys()))
+        if not exists:
+            writer.writeheader()
+        writer.writerow(row)
 
 
 def apply_cpu_affinity(cores: list[int] | None) -> None:
@@ -128,6 +143,20 @@ def write_summary_pdf(path: str, summary_rows: list[dict], metadata: dict) -> No
                 axes = [axes]
             for ax, act in zip(axes, activations):
                 d = sub[sub["activation"] == act].sort_values(sweep_label)
+                ax.plot(d[sweep_label], d["std_test_accuracy"], marker="o")
+                ax.set_title(f"{model_type} / {act}")
+                ax.set_xlabel(sweep_label)
+                ax.grid(True, alpha=0.3)
+            axes[0].set_ylabel("std test accuracy")
+            plt.tight_layout()
+            pdf.savefig(fig)
+            plt.close(fig)
+
+            fig, axes = plt.subplots(1, n, figsize=(4 * n, 3), sharey=True)
+            if n == 1:
+                axes = [axes]
+            for ax, act in zip(axes, activations):
+                d = sub[sub["activation"] == act].sort_values(sweep_label)
                 ax.errorbar(
                     d[sweep_label],
                     d["mean_test_loss"],
@@ -147,11 +176,16 @@ def write_summary_pdf(path: str, summary_rows: list[dict], metadata: dict) -> No
                 axes = [axes]
             for ax, act in zip(axes, activations):
                 d = sub[sub["activation"] == act].sort_values(sweep_label)
-                ax.plot(d[sweep_label], d["std_test_accuracy"], marker="o")
+                ax.errorbar(
+                    d[sweep_label],
+                    d["mean_train_loss"],
+                    yerr=d["stderr_train_loss"],
+                    marker="o",
+                )
                 ax.set_title(f"{model_type} / {act}")
                 ax.set_xlabel(sweep_label)
                 ax.grid(True, alpha=0.3)
-            axes[0].set_ylabel("std test accuracy")
+            axes[0].set_ylabel("mean train loss")
             plt.tight_layout()
             pdf.savefig(fig)
             plt.close(fig)
@@ -370,6 +404,20 @@ def main() -> None:
     print(f"  {pdf_path}")
     elapsed = datetime.now() - start_time
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Elapsed: {elapsed}")
+    script_name = os.path.splitext(os.path.basename(__file__))[0]
+    runtime_log_path = os.path.join(output_dir, f"runtime_log_{script_name}.csv")
+    append_runtime_log(
+        runtime_log_path,
+        {
+            "timestamp_start": start_time.strftime("%Y-%m-%d %H:%M:%S"),
+            "timestamp_end": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "elapsed_seconds": int(elapsed.total_seconds()),
+            "script": "run_experiments_noisy_training_data.py",
+            "cache_key": cache_key,
+            "output_dir": output_dir,
+            "total_runs": len(configs),
+        },
+    )
 
 
 if __name__ == "__main__":

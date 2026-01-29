@@ -26,6 +26,26 @@ x_i, & \text{with probability } 1-p,
 Training uses corrupted inputs $\tilde{x} = \mathcal{C}_p(x)$ and clean labels $y$.
 We study the test accuracy $A(p)$ of a network trained at corruption strength $p$.
 
+\paragraph{Additive channel.}
+We also consider an additive noise channel with strength $\sigma$:
+\[
+\tilde{x}_i = \mathrm{clip}\big(x_i + \epsilon_i,\,0,\,1\big), \quad
+\epsilon_i \sim \mathrm{Uniform}(-\sigma/2,\sigma/2),
+\]
+with independent noise across pixels.
+
+\paragraph{Binary replacement channel.}
+For binarized MNIST, we threshold each pixel as $x_i \leftarrow \mathbb{I}[x_i \ge 1/2]$.
+The binary corruption replaces each pixel with a Bernoulli(1/2) value with probability $p$:
+\[
+(\mathcal{B}_p(x))_i =
+\begin{cases}
+b_i, & \text{with probability } p,\\
+x_i, & \text{with probability } 1-p,
+\end{cases}
+\quad b_i \sim \mathrm{Bernoulli}(1/2).
+\]
+
 \section*{Corruption as Attenuation + Noise}
 Let $M_i \sim \mathrm{Bernoulli}(p)$ and $u_i \sim \mathrm{Uniform}(0,1)$, independent. Then
 \[
@@ -149,5 +169,28 @@ The classifier training iterations are governed by \texttt{rbm\_classifier\_max\
 When the input is corrupted by the replacement or additive channel, the RBM is trained on
 $\tilde{v} = \mathcal{C}(v)$; the same corruption is applied at test time for evaluating
 accuracy vs.\ corruption strength.
+
+\section*{Empirical NTK Diagnostics (Finite Width)}
+For a network $f(x;\theta)$, the empirical NTK at parameters $\theta$ is
+\[
+K_\theta(x,x') = \nabla_\theta f(x;\theta)^\top \nabla_\theta f(x';\theta).
+\]
+At finite width, $K_\theta$ depends on the initialization and evolves with training.
+We compute $K_\theta$ after training on corrupted data and evaluate it on a small
+subset of inputs (typically a random subset of the test set).
+
+\paragraph{Effective rank and spectral entropy.}
+Let $\{\lambda_i\}$ be the eigenvalues of $K_\theta$ and define
+$\tilde{\lambda}_i = \lambda_i / \sum_j \lambda_j$. The spectral entropy is
+\[
+H = -\sum_i \tilde{\lambda}_i \log \tilde{\lambda}_i,
+\]
+and the effective rank is
+\[
+r_{\mathrm{eff}} = \exp(H).
+\]
+We track $r_{\mathrm{eff}}$ (and $H$) versus corruption strength to quantify how the
+NTK spectrum flattens or concentrates as $p$ increases. We also record eigenvalue
+histograms at selected $p$ values to visualize the full spectral distribution.
 
 \end{document}

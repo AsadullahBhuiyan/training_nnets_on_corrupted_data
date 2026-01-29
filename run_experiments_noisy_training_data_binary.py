@@ -42,6 +42,7 @@ def summarize_runs(rows: list[dict]) -> list[dict]:
     for (activation, model_type, p), items in grouped.items():
         accs = [float(r["test_accuracy"]) for r in items]
         losses = [float(r["test_loss"]) for r in items]
+        train_losses = [float(r.get("train_loss", 0.0)) for r in items]
         summary_rows.append(
             {
                 "activation": activation,
@@ -59,10 +60,24 @@ def summarize_runs(rows: list[dict]) -> list[dict]:
                 "stderr_test_loss": (statistics.pstdev(losses) / (len(items) ** 0.5))
                 if len(items) > 1
                 else 0.0,
+                "mean_train_loss": statistics.mean(train_losses),
+                "std_train_loss": statistics.pstdev(train_losses) if len(train_losses) > 1 else 0.0,
+                "stderr_train_loss": (statistics.pstdev(train_losses) / (len(items) ** 0.5))
+                if len(items) > 1
+                else 0.0,
             }
         )
     summary_rows.sort(key=lambda r: (r["model_type"], r["activation"], r["p"]))
     return summary_rows
+
+
+def append_runtime_log(path: str, row: dict) -> None:
+    exists = os.path.exists(path)
+    with open(path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(row.keys()))
+        if not exists:
+            writer.writeheader()
+        writer.writerow(row)
 
 
 def apply_cpu_affinity(cores: list[int] | None) -> None:
@@ -197,6 +212,7 @@ def train_and_evaluate_binary(cfg: dict) -> dict:
         weight_decay=cfg["weight_decay"],
     )
 
+    last_train_loss = 0.0
     for _ in tqdm(
         range(cfg["epochs"]),
         desc=f"epochs (w={cfg['mlp_width']}, p={cfg['p']:.3f})",
@@ -215,7 +231,7 @@ def train_and_evaluate_binary(cfg: dict) -> dict:
             loss.backward()
             optimizer.step()
             total_loss += loss.item() * x.size(0)
-        _ = total_loss / len(train_loader.dataset)
+        last_train_loss = total_loss / len(train_loader.dataset)
 
     test_loss, test_acc = evaluate(model, test_loader, device, cfg["loss_type"])
     return {
@@ -224,6 +240,7 @@ def train_and_evaluate_binary(cfg: dict) -> dict:
         "corruption_mode": "binary_replacement",
         "p": cfg["p"],
         "seed": cfg["seed"],
+        "train_loss": last_train_loss,
         "test_loss": test_loss,
         "test_accuracy": test_acc,
         "mlp_hidden_sizes": cfg["mlp_hidden_sizes"],
@@ -282,6 +299,20 @@ def write_summary_pdf(path: str, summary_rows: list[dict], metadata: dict) -> No
                 axes = [axes]
             for ax, act in zip(axes, activations):
                 d = sub[sub["activation"] == act].sort_values("p")
+                ax.plot(d["p"], d["std_test_accuracy"], marker="o")
+                ax.set_title(f"{model_type} / {act}")
+                ax.set_xlabel("p")
+                ax.grid(True, alpha=0.3)
+            axes[0].set_ylabel("std test accuracy")
+            plt.tight_layout()
+            pdf.savefig(fig)
+            plt.close(fig)
+
+            fig, axes = plt.subplots(1, n, figsize=(4 * n, 3), sharey=True)
+            if n == 1:
+                axes = [axes]
+            for ax, act in zip(axes, activations):
+                d = sub[sub["activation"] == act].sort_values("p")
                 ax.errorbar(
                     d["p"],
                     d["mean_test_loss"],
@@ -301,11 +332,16 @@ def write_summary_pdf(path: str, summary_rows: list[dict], metadata: dict) -> No
                 axes = [axes]
             for ax, act in zip(axes, activations):
                 d = sub[sub["activation"] == act].sort_values("p")
-                ax.plot(d["p"], d["std_test_accuracy"], marker="o")
+                ax.errorbar(
+                    d["p"],
+                    d["mean_train_loss"],
+                    yerr=d["stderr_train_loss"],
+                    marker="o",
+                )
                 ax.set_title(f"{model_type} / {act}")
                 ax.set_xlabel("p")
                 ax.grid(True, alpha=0.3)
-            axes[0].set_ylabel("std test accuracy")
+            axes[0].set_ylabel("mean train loss")
             plt.tight_layout()
             pdf.savefig(fig)
             plt.close(fig)
@@ -470,6 +506,20 @@ def main() -> None:
     print(f"  {pdf_path}")
     elapsed = datetime.now() - start_time
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Elapsed: {elapsed}")
+    script_name = os.path.splitext(os.path.basename(__file__))[0]
+    runtime_log_path = os.path.join(output_dir, f"runtime_log_{script_name}.csv")
+    append_runtime_log(
+        runtime_log_path,
+        {
+            "timestamp_start": start_time.strftime("%Y-%m-%d %H:%M:%S"),
+            "timestamp_end": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "elapsed_seconds": int(elapsed.total_seconds()),
+            "script": "run_experiments_noisy_training_data_binary.py",
+            "cache_key": cache_key,
+            "output_dir": output_dir,
+            "total_runs": len(configs),
+        },
+    )
 
 
 if __name__ == "__main__":

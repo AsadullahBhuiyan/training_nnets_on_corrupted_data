@@ -67,6 +67,15 @@ def summarize_runs(rows: list[dict]) -> list[dict]:
     return summary_rows
 
 
+def append_runtime_log(path: str, row: dict) -> None:
+    exists = os.path.exists(path)
+    with open(path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(row.keys()))
+        if not exists:
+            writer.writeheader()
+        writer.writerow(row)
+
+
 def apply_cpu_affinity(cores: list[int] | None) -> None:
     if not cores:
         return
@@ -323,6 +332,20 @@ def main() -> None:
     print(f"  {pdf_path}")
     elapsed = datetime.now() - start_time
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Elapsed: {elapsed}")
+    script_name = os.path.splitext(os.path.basename(__file__))[0]
+    runtime_log_path = os.path.join(output_dir, f"runtime_log_{script_name}.csv")
+    append_runtime_log(
+        runtime_log_path,
+        {
+            "timestamp_start": start_time.strftime("%Y-%m-%d %H:%M:%S"),
+            "timestamp_end": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "elapsed_seconds": int(elapsed.total_seconds()),
+            "script": "run_experiments_rbm_training_data.py",
+            "cache_key": cache_key,
+            "output_dir": output_dir,
+            "total_runs": len(configs),
+        },
+    )
 
 
 if __name__ == "__main__":
