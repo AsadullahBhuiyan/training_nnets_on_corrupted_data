@@ -5,6 +5,7 @@ import csv
 import random
 import statistics
 import math
+from collections import deque
 from datetime import datetime
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import numpy as np
@@ -466,17 +467,18 @@ def main() -> None:
     activations = ["relu", "tanh", "sigmoid", "gelu"]
     model_types = ["mlp"]
     corruption_mode = "replacement"  # options: "replacement", "additive"
-    ps = np.linspace(0.8, 1.0, 21)
+    ps = np.linspace(0, 1.0, 21)
     sigmas = [0.0, 0.1, 0.2, 0.4, 0.6, 0.8, 1.0]
-    width = 256
-    depths = [1, 2, 3, 4]
-    repeats = 50
-    epochs = 10
+    width = 64
+    depths = [1, 4, 8]
+    repeats = 20
+    epochs = 30
     batch_size = 128
     learning_rate = 1e-3
     weight_decay = 0.0
     loss_type = "cross_entropy"  # options: "cross_entropy", "quadratic"
     max_workers = cpu_max
+    max_in_flight = max(1, cpu_max // 2)
     data_workers = 0
     cpu_threads_per_worker = 1
     cpu_cores = list(range(cpu_max))  # Example: [0, 1, 2, 3] to pin processes.
@@ -486,7 +488,7 @@ def main() -> None:
     ntk_output = "true"  # options: "true", "all"
     ntk_use_corrupted_inputs = True
     ntk_seed = 1234
-    ntk_hist_ps = [0.8, 0.9, 0.92, 0.94, 0.96, 0.98, 1.0]
+    ntk_hist_ps = [0, 0.5, 0.7, 0.8, 0.9, 0.92, 0.94, 0.96, 0.98, 1.0]
     ntk_hist_tol = 1e-3
     ntk_show_progress = True
     custom_split = False
@@ -565,27 +567,44 @@ def main() -> None:
 
     results: list[dict] = []
     seen_values: set[float] = set()
+    run_start_times = {}
+    queue = deque(configs)
+    total_runs = len(configs)
     with ProcessPoolExecutor(
         max_workers=max_workers,
         initializer=_init_worker,
         initargs=(cpu_cores,),
     ) as executor:
-        futures = [executor.submit(train_and_evaluate, cfg) for cfg in configs]
+        in_flight: dict = {}
         desc = f"Runs{suffix_note} (depths={depths})"
-        for future in tqdm(as_completed(futures), total=len(futures), desc=desc, unit="run"):
-            res = future.result()
-            results.append(res)
-            strength_value = res["p"] if corruption_mode == "replacement" else res["sigma"]
-            if strength_value not in seen_values:
-                seen_values.add(strength_value)
+        pbar = tqdm(total=total_runs, desc=desc, unit="run")
+        while queue or in_flight:
+            while queue and len(in_flight) < max_in_flight:
+                cfg = queue.popleft()
+                fut = executor.submit(train_and_evaluate, cfg)
+                in_flight[fut] = cfg
+                run_start_times[fut] = datetime.now()
+            for future in as_completed(in_flight):
+                res = future.result()
+                results.append(res)
+                pbar.update(1)
+                strength_value = res["p"] if corruption_mode == "replacement" else res["sigma"]
+                if strength_value not in seen_values:
+                    seen_values.add(strength_value)
+                    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    print(f"[{timestamp}] new {sweep_label} encountered: {strength_value:.3f}")
                 timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                print(f"[{timestamp}] new {sweep_label} encountered: {strength_value:.3f}")
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            depth = len(res["mlp_hidden_sizes"]) if res["mlp_hidden_sizes"] else 0
-            print(
-                f"[{timestamp}] done: model={res['model_type']} act={res['activation']} "
-                f"{sweep_label}={strength_value:.3f} depth={depth} acc={res['test_accuracy']:.4f}"
-            )
+                depth = len(res["mlp_hidden_sizes"]) if res["mlp_hidden_sizes"] else 0
+                pbar.set_postfix_str(f"depth={depth}")
+                elapsed_run = datetime.now() - run_start_times.get(future, datetime.now())
+                print(
+                    f"[{timestamp}] done: model={res['model_type']} act={res['activation']} "
+                    f"{sweep_label}={strength_value:.3f} depth={depth} acc={res['test_accuracy']:.4f} "
+                    f"elapsed={elapsed_run}"
+                )
+                del in_flight[future]
+                break
+        pbar.close()
 
     cache_key = build_cache_key(
         repeats=repeats,
@@ -631,6 +650,7 @@ def main() -> None:
         "ntk_hist_tol": ntk_hist_tol,
         "ntk_show_progress": ntk_show_progress,
         "max_workers": max_workers,
+        "max_in_flight": max_in_flight,
         "data_workers": data_workers,
         "cpu_threads_per_worker": cpu_threads_per_worker,
         "cpu_cores": cpu_cores,

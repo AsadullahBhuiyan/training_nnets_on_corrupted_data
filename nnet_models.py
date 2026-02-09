@@ -65,6 +65,11 @@ def get_device(use_cuda: bool) -> torch.device:
     return torch.device("cpu")
 
 
+class Square(nn.Module):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x * x
+
+
 def get_activation(name: str) -> nn.Module:
     name = name.lower()
     if name == "relu":
@@ -77,6 +82,10 @@ def get_activation(name: str) -> nn.Module:
         return nn.LeakyReLU(0.1)
     if name == "gelu":
         return nn.GELU()
+    if name == "linear":
+        return nn.Identity()
+    if name in ("quadratic", "square"):
+        return Square()
     raise ValueError(f"Unsupported activation: {name}")
 
 

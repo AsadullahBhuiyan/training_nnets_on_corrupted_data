@@ -5,6 +5,7 @@ import csv
 import random
 import statistics
 import math
+from collections import deque
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime
 import numpy as np
@@ -41,12 +42,15 @@ def summarize_runs(rows: list[dict]) -> list[dict]:
         grouped.setdefault(key, []).append(row)
 
     summary_rows: list[dict] = []
+    def _finite(values: list[float]) -> list[float]:
+        return [v for v in values if v is not None and math.isfinite(v)]
+
     for (activation, model_type, corruption_mode, p, sigma, width), items in grouped.items():
         accs = [float(r["test_accuracy"]) for r in items]
         losses = [float(r["test_loss"]) for r in items]
         train_losses = [float(r.get("train_loss", 0.0)) for r in items]
-        ntk_ranks = [float(r.get("ntk_rank", 0.0)) for r in items if r.get("ntk_rank") is not None]
-        ntk_entropies = [float(r.get("ntk_entropy", 0.0)) for r in items if r.get("ntk_entropy") is not None]
+        ntk_ranks = _finite([float(r.get("ntk_rank", math.nan)) for r in items])
+        ntk_entropies = _finite([float(r.get("ntk_entropy", math.nan)) for r in items])
         summary_rows.append(
             {
                 "activation": activation,
@@ -72,15 +76,15 @@ def summarize_runs(rows: list[dict]) -> list[dict]:
                 if len(items) > 1
                 else 0.0,
                 "mean_ntk_rank": statistics.mean(ntk_ranks) if ntk_ranks else math.nan,
-                "std_ntk_rank": statistics.pstdev(ntk_ranks) if len(ntk_ranks) > 1 else 0.0,
+                "std_ntk_rank": statistics.pstdev(ntk_ranks) if len(ntk_ranks) > 1 else math.nan,
                 "stderr_ntk_rank": (statistics.pstdev(ntk_ranks) / (len(ntk_ranks) ** 0.5))
                 if len(ntk_ranks) > 1
-                else 0.0,
+                else math.nan,
                 "mean_ntk_entropy": statistics.mean(ntk_entropies) if ntk_entropies else math.nan,
-                "std_ntk_entropy": statistics.pstdev(ntk_entropies) if len(ntk_entropies) > 1 else 0.0,
+                "std_ntk_entropy": statistics.pstdev(ntk_entropies) if len(ntk_entropies) > 1 else math.nan,
                 "stderr_ntk_entropy": (statistics.pstdev(ntk_entropies) / (len(ntk_entropies) ** 0.5))
                 if len(ntk_entropies) > 1
-                else 0.0,
+                else math.nan,
             }
         )
     summary_rows.sort(
@@ -463,25 +467,26 @@ def build_cache_key(
 def main() -> None:
     start_time = datetime.now()
     # Manual configuration (edit these values directly).
-    activations = ["relu", "tanh", "sigmoid"]
+    activations = ["relu"]
     model_types = ["mlp"]  # width sweep is MLP-only
     corruption_mode = "replacement"  # options: "replacement", "additive"
-    ps = np.linspace(0.75, 1.0, 31)
+    ps = np.linspace(0.9, 1.0, 51)
     sigmas = [0.0, 0.1, 0.2, 0.4, 0.6, 0.8, 1.0]
-    widths = [64, 128, 256]
+    widths = [128, 256, 512, 1024]
     mlp_depth = 1
     repeats = 100
     epochs = 20
-    batch_size = 64
+    batch_size = 128
     learning_rate = 1e-3
     weight_decay = 0.0
     loss_type = "cross_entropy"  # options: "cross_entropy", "quadratic"
     max_workers = cpu_max
+    max_in_flight = max(1, cpu_max)
     data_workers = 0
     cpu_threads_per_worker = 1
     cpu_cores = list(range(cpu_max))  # Example: [0, 1, 2, 3] to pin processes.
     brightness_scale = 1.0
-    ntk_compute = True
+    ntk_compute = False
     ntk_subset_size = 64
     ntk_output = "true"  # options: "true", "all"
     ntk_use_corrupted_inputs = True
@@ -494,7 +499,7 @@ def main() -> None:
     split_seed = 1234
     split_source = "train"
     output_dir = "results"
-    suffix = None
+    suffix = "width_sweep_relu_only"
     seed = 1234
     max_train_samples = None
     use_cuda = False
@@ -566,33 +571,42 @@ def main() -> None:
     results: list[dict] = []
     seen_values: set[float] = set()
     run_start_times = {}
+    queue = deque(configs)
+    total_runs = len(configs)
     with ProcessPoolExecutor(
         max_workers=max_workers,
         initializer=_init_worker,
         initargs=(cpu_cores,),
     ) as executor:
-        futures = []
-        for cfg in configs:
-            fut = executor.submit(train_and_evaluate, cfg)
-            futures.append(fut)
-            run_start_times[fut] = datetime.now()
+        in_flight: dict = {}
         desc = f"Runs{suffix_note} (widths={widths})"
-        for future in tqdm(as_completed(futures), total=len(futures), desc=desc, unit="run"):
-            res = future.result()
-            results.append(res)
-            strength_value = res["p"] if corruption_mode == "replacement" else res["sigma"]
-            if strength_value not in seen_values:
-                seen_values.add(strength_value)
+        pbar = tqdm(total=total_runs, desc=desc, unit="run")
+        while queue or in_flight:
+            while queue and len(in_flight) < max_in_flight:
+                cfg = queue.popleft()
+                fut = executor.submit(train_and_evaluate, cfg)
+                in_flight[fut] = cfg
+                run_start_times[fut] = datetime.now()
+            for future in as_completed(in_flight):
+                res = future.result()
+                results.append(res)
+                pbar.update(1)
+                strength_value = res["p"] if corruption_mode == "replacement" else res["sigma"]
+                if strength_value not in seen_values:
+                    seen_values.add(strength_value)
+                    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    print(f"[{timestamp}] new {sweep_label} encountered: {strength_value:.3f}")
                 timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                print(f"[{timestamp}] new {sweep_label} encountered: {strength_value:.3f}")
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            width = res["mlp_hidden_sizes"][0] if res["mlp_hidden_sizes"] else -1
-            elapsed = datetime.now() - run_start_times.get(future, datetime.now())
-            print(
-                f"[{timestamp}] done: model={res['model_type']} act={res['activation']} "
-                f"{sweep_label}={strength_value:.3f} width={width} acc={res['test_accuracy']:.4f} "
-                f"elapsed={elapsed}"
-            )
+                width = res["mlp_hidden_sizes"][0] if res["mlp_hidden_sizes"] else -1
+                elapsed = datetime.now() - run_start_times.get(future, datetime.now())
+                print(
+                    f"[{timestamp}] done: model={res['model_type']} act={res['activation']} "
+                    f"{sweep_label}={strength_value:.3f} width={width} acc={res['test_accuracy']:.4f} "
+                    f"elapsed={elapsed}"
+                )
+                del in_flight[future]
+                break
+        pbar.close()
 
     cache_key = build_cache_key(
         repeats=repeats,
@@ -638,6 +652,7 @@ def main() -> None:
         "ntk_hist_tol": ntk_hist_tol,
         "ntk_show_progress": ntk_show_progress,
         "max_workers": max_workers,
+        "max_in_flight": max_in_flight,
         "data_workers": data_workers,
         "cpu_threads_per_worker": cpu_threads_per_worker,
         "cpu_cores": cpu_cores,
