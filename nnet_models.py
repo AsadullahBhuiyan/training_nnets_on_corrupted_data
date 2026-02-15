@@ -1,5 +1,7 @@
 import math
 import random
+import os
+import sys
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Iterable, Tuple
@@ -36,6 +38,14 @@ class TrainConfig:
     test_fraction: float = 0.2
     split_seed: int = 1234
     split_source: str = "train"  # options: "train", "full"
+    dataset_name: str = "mnist"  # options: "mnist", "infimnist"
+    dataset_dim: int | None = None
+    infimnist_alpha: float = 1.0
+    infimnist_translate: bool = True
+    infimnist_cache_dir: str | None = None
+    exact_sample_counts: bool = False
+    exact_train_samples: int | None = None
+    exact_test_samples: int | None = None
     cpu_threads: int = 1
     brightness_scale: float = 1.0
     rbm_components: int = 256
@@ -307,6 +317,123 @@ def _limit_dataset(base: Dataset, max_samples: int | None) -> Dataset:
     return torch.utils.data.Subset(base, list(range(max_samples)))
 
 
+def _import_infimnist_module():
+    try:
+        import _infimnist as infimnist  # type: ignore
+        return infimnist
+    except ImportError:
+        local_path = os.path.join(os.path.dirname(__file__), "infimnist_py")
+        if os.path.isdir(local_path) and local_path not in sys.path:
+            sys.path.insert(0, local_path)
+        try:
+            import _infimnist as infimnist  # type: ignore
+            return infimnist
+        except ImportError as exc:
+            raise ImportError(
+                "Could not import _infimnist. Build infimnist_py and ensure it is on PYTHONPATH."
+            ) from exc
+
+
+def _validate_infimnist_data_dir(infimnist_module) -> str:
+    module_dir = os.path.dirname(infimnist_module.__file__)
+    data_dir = os.path.join(module_dir, "data")
+    required = [
+        "train-images-idx3-ubyte",
+        "train-labels-idx1-ubyte",
+        "t10k-images-idx3-ubyte",
+        "t10k-labels-idx1-ubyte",
+        "fields_float_1522x28x28.bin",
+        "tangVec_float_60000x28x28.bin",
+    ]
+    missing = [name for name in required if not os.path.exists(os.path.join(data_dir, name))]
+    if missing:
+        raise FileNotFoundError(
+            "infimnist data files are missing. Expected under "
+            f"'{data_dir}'. Missing: {missing}. "
+            "Fix by linking MNIST raw files, e.g. "
+            "'rm -f infimnist_py/data && ln -s /home/abhuiyan/nnet_error_project/data/MNIST/raw infimnist_py/data'."
+        )
+    return data_dir
+
+
+def _build_infimnist_subset(
+    indices: np.ndarray,
+    brightness_scale: float,
+    alpha: float,
+    translate: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    infimnist = _import_infimnist_module()
+    _validate_infimnist_data_dir(infimnist)
+    generator = infimnist.InfimnistGenerator(alpha=alpha, translate=translate)
+    digits, labels = generator.gen(np.asarray(indices, dtype=np.int64))
+    x = digits.astype(np.float32).reshape(-1, 1, 28, 28) / 255.0
+    x = np.clip(x * brightness_scale, 0.0, 1.0)
+    y = labels.astype(np.int64)
+    # Avoid torch.from_numpy() because some envs hit numpy C-API type mismatch.
+    return torch.tensor(x, dtype=torch.float32), torch.tensor(y, dtype=torch.long)
+
+
+def _validate_infimnist_cache_dir(cache_dir: str) -> tuple[str, str, int]:
+    if not cache_dir:
+        raise ValueError("infimnist_cache_dir is empty.")
+    if not os.path.isdir(cache_dir):
+        raise FileNotFoundError(f"infimnist_cache_dir does not exist: {cache_dir}")
+
+    images_path = os.path.join(cache_dir, "images_uint8.npy")
+    labels_path = os.path.join(cache_dir, "labels_uint8.npy")
+    missing = [p for p in [images_path, labels_path] if not os.path.exists(p)]
+    if missing:
+        raise FileNotFoundError(
+            f"InfiMNIST cache is incomplete under '{cache_dir}'. Missing: {missing}"
+        )
+
+    images = np.load(images_path, mmap_mode="r")
+    labels = np.load(labels_path, mmap_mode="r")
+    if images.ndim != 3 or images.shape[1:] != (28, 28):
+        raise ValueError(
+            f"Expected images_uint8.npy shape (N, 28, 28), got {images.shape}."
+        )
+    if labels.ndim != 1:
+        raise ValueError(f"Expected labels_uint8.npy shape (N,), got {labels.shape}.")
+    if images.shape[0] != labels.shape[0]:
+        raise ValueError(
+            f"Cache size mismatch: images={images.shape[0]}, labels={labels.shape[0]}."
+        )
+    if images.dtype != np.uint8:
+        raise ValueError(f"Expected uint8 cached images, got {images.dtype}.")
+    if not np.issubdtype(labels.dtype, np.integer):
+        raise ValueError(f"Expected integer cached labels, got {labels.dtype}.")
+    return images_path, labels_path, int(images.shape[0])
+
+
+class IndexedInfiMNISTCacheDataset(Dataset):
+    def __init__(
+        self,
+        images_path: str,
+        labels_path: str,
+        indices: np.ndarray,
+        brightness_scale: float,
+    ) -> None:
+        self.images = np.load(images_path, mmap_mode="r")
+        self.labels = np.load(labels_path, mmap_mode="r")
+        self.indices = np.asarray(indices, dtype=np.int64)
+        self.brightness_scale = float(brightness_scale)
+
+    def __len__(self) -> int:
+        return int(self.indices.shape[0])
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
+        src_idx = int(self.indices[idx])
+        # Copy into writable memory to avoid torch warning on read-only memmaps.
+        x_np = np.array(self.images[src_idx], dtype=np.float32, copy=True)
+        # Avoid torch.from_numpy() because some envs hit numpy C-API type mismatch.
+        x = torch.tensor(x_np, dtype=torch.float32).unsqueeze(0).div_(255.0)
+        if self.brightness_scale != 1.0:
+            x = torch.clamp(x * self.brightness_scale, 0.0, 1.0)
+        y = int(self.labels[src_idx])
+        return x, y
+
+
 def get_dataloaders(
     batch_size: int,
     p: float,
@@ -319,17 +446,111 @@ def get_dataloaders(
     test_fraction: float = 0.2,
     split_seed: int = 1234,
     split_source: str = "train",
+    dataset_name: str = "mnist",
+    dataset_dim: int | None = None,
+    infimnist_alpha: float = 1.0,
+    infimnist_translate: bool = True,
+    infimnist_cache_dir: str | None = None,
+    exact_sample_counts: bool = False,
+    exact_train_samples: int | None = None,
+    exact_test_samples: int | None = None,
 ) -> Tuple[DataLoader, DataLoader]:
-    transform = transforms.Compose(
-        [
-            transforms.ToTensor(),
-            transforms.Lambda(lambda x: torch.clamp(x * brightness_scale, 0.0, 1.0)),
-        ]
-    )
-    train_base = datasets.MNIST(root="./data", train=True, download=True, transform=transform)
-    test_base = datasets.MNIST(root="./data", train=False, download=True, transform=transform)
+    dataset_name = dataset_name.lower()
+    if dataset_name not in ("mnist", "infimnist"):
+        raise ValueError(f"Unsupported dataset_name: {dataset_name}")
 
-    if custom_split:
+    if dataset_name == "mnist":
+        transform = transforms.Compose(
+            [
+                transforms.ToTensor(),
+                transforms.Lambda(lambda x: torch.clamp(x * brightness_scale, 0.0, 1.0)),
+            ]
+        )
+        train_base = datasets.MNIST(root="./data", train=True, download=True, transform=transform)
+        test_base = datasets.MNIST(root="./data", train=False, download=True, transform=transform)
+    else:
+        if not exact_sample_counts:
+            raise ValueError(
+                "dataset_name='infimnist' currently requires exact_sample_counts=True."
+            )
+        cache_images_path: str | None = None
+        cache_labels_path: str | None = None
+        cache_size: int | None = None
+        if infimnist_cache_dir:
+            cache_images_path, cache_labels_path, cache_size = _validate_infimnist_cache_dir(
+                infimnist_cache_dir
+            )
+        if dataset_dim is None:
+            if cache_size is not None:
+                dataset_dim = cache_size
+            else:
+                raise ValueError("Set dataset_dim > 1 when dataset_name='infimnist'.")
+        if dataset_dim <= 1:
+            raise ValueError("Set dataset_dim > 1 when dataset_name='infimnist'.")
+        if cache_size is not None and int(dataset_dim) > cache_size:
+            raise ValueError(
+                f"dataset_dim={int(dataset_dim)} exceeds cache size={cache_size} in "
+                f"'{infimnist_cache_dir}'."
+            )
+        n_train = int(exact_train_samples or 0)
+        n_test = int(exact_test_samples or 0)
+        if n_train <= 0 or n_test <= 0:
+            raise ValueError(
+                "exact_train_samples and exact_test_samples must be positive when dataset_name='infimnist'."
+            )
+        if n_train + n_test > int(dataset_dim):
+            raise ValueError(
+                f"Requested n_train+n_test={n_train+n_test} exceeds dataset_dim={dataset_dim}."
+            )
+        rng = np.random.default_rng(split_seed)
+        picked = rng.choice(int(dataset_dim), size=n_train + n_test, replace=False)
+        train_idx = picked[:n_train]
+        test_idx = picked[n_train : n_train + n_test]
+        if cache_images_path is not None and cache_labels_path is not None:
+            train_base = IndexedInfiMNISTCacheDataset(
+                images_path=cache_images_path,
+                labels_path=cache_labels_path,
+                indices=train_idx,
+                brightness_scale=brightness_scale,
+            )
+            test_base = IndexedInfiMNISTCacheDataset(
+                images_path=cache_images_path,
+                labels_path=cache_labels_path,
+                indices=test_idx,
+                brightness_scale=brightness_scale,
+            )
+        else:
+            x_train, y_train = _build_infimnist_subset(
+                train_idx,
+                brightness_scale=brightness_scale,
+                alpha=infimnist_alpha,
+                translate=infimnist_translate,
+            )
+            x_test, y_test = _build_infimnist_subset(
+                test_idx,
+                brightness_scale=brightness_scale,
+                alpha=infimnist_alpha,
+                translate=infimnist_translate,
+            )
+            train_base = torch.utils.data.TensorDataset(x_train, y_train)
+            test_base = torch.utils.data.TensorDataset(x_test, y_test)
+
+    if exact_sample_counts and dataset_name == "mnist":
+        full = torch.utils.data.ConcatDataset([train_base, test_base])
+        n_total = len(full)
+        n_train = int(exact_train_samples or 0)
+        n_test = int(exact_test_samples or 0)
+        if n_train <= 0 or n_test <= 0:
+            raise ValueError("exact_train_samples and exact_test_samples must be positive when exact_sample_counts=True.")
+        if n_train + n_test > n_total:
+            raise ValueError(
+                f"Requested exact samples exceed dataset size: n_train+n_test={n_train+n_test}, total={n_total}."
+            )
+        generator = torch.Generator().manual_seed(split_seed)
+        perm = torch.randperm(n_total, generator=generator).tolist()
+        train_base = torch.utils.data.Subset(full, perm[:n_train])
+        test_base = torch.utils.data.Subset(full, perm[n_train : n_train + n_test])
+    elif custom_split:
         if split_source == "full":
             full = torch.utils.data.ConcatDataset([train_base, test_base])
         else:
@@ -519,6 +740,14 @@ def train_and_evaluate(cfg: TrainConfig) -> dict:
         test_fraction=cfg.test_fraction,
         split_seed=cfg.split_seed,
         split_source=cfg.split_source,
+        dataset_name=cfg.dataset_name,
+        dataset_dim=cfg.dataset_dim,
+        infimnist_alpha=cfg.infimnist_alpha,
+        infimnist_translate=cfg.infimnist_translate,
+        infimnist_cache_dir=cfg.infimnist_cache_dir,
+        exact_sample_counts=cfg.exact_sample_counts,
+        exact_train_samples=cfg.exact_train_samples,
+        exact_test_samples=cfg.exact_test_samples,
     )
     model = build_model(
         cfg.model_type,

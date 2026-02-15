@@ -42,15 +42,10 @@ def summarize_runs(rows: list[dict]) -> list[dict]:
         grouped.setdefault(key, []).append(row)
 
     summary_rows: list[dict] = []
-    def _finite(values: list[float]) -> list[float]:
-        return [v for v in values if v is not None and math.isfinite(v)]
-
     for (activation, model_type, corruption_mode, p, sigma, width), items in grouped.items():
         accs = [float(r["test_accuracy"]) for r in items]
         losses = [float(r["test_loss"]) for r in items]
         train_losses = [float(r.get("train_loss", 0.0)) for r in items]
-        ntk_ranks = _finite([float(r.get("ntk_rank", math.nan)) for r in items])
-        ntk_entropies = _finite([float(r.get("ntk_entropy", math.nan)) for r in items])
         summary_rows.append(
             {
                 "activation": activation,
@@ -75,16 +70,6 @@ def summarize_runs(rows: list[dict]) -> list[dict]:
                 "stderr_train_loss": (statistics.pstdev(train_losses) / (len(items) ** 0.5))
                 if len(items) > 1
                 else 0.0,
-                "mean_ntk_rank": statistics.mean(ntk_ranks) if ntk_ranks else math.nan,
-                "std_ntk_rank": statistics.pstdev(ntk_ranks) if len(ntk_ranks) > 1 else math.nan,
-                "stderr_ntk_rank": (statistics.pstdev(ntk_ranks) / (len(ntk_ranks) ** 0.5))
-                if len(ntk_ranks) > 1
-                else math.nan,
-                "mean_ntk_entropy": statistics.mean(ntk_entropies) if ntk_entropies else math.nan,
-                "std_ntk_entropy": statistics.pstdev(ntk_entropies) if len(ntk_entropies) > 1 else math.nan,
-                "stderr_ntk_entropy": (statistics.pstdev(ntk_entropies) / (len(ntk_entropies) ** 0.5))
-                if len(ntk_entropies) > 1
-                else math.nan,
             }
         )
     summary_rows.sort(
@@ -222,23 +207,11 @@ def _init_worker(cores: list[int] | None) -> None:
 def write_summary_pdf(
     path: str,
     summary_rows: list[dict],
-    raw_rows: list[dict],
     metadata: dict,
-    ntk_hist_ps: list[float],
 ) -> None:
     df = pd.DataFrame(summary_rows)
-    raw_df = pd.DataFrame(raw_rows)
     model_types = sorted(df["model_type"].unique())
     sweep_label = "sigma" if (not df.empty and "additive" in df["corruption_mode"].unique()) else "p"
-    if not df.empty:
-        grid_vals = sorted(df[sweep_label].unique())
-        tol = metadata.get("ntk_hist_tol", 1e-6)
-        snapped = []
-        for target in ntk_hist_ps:
-            nearest = min(grid_vals, key=lambda v: abs(v - target))
-            if abs(nearest - target) <= tol:
-                snapped.append(float(nearest))
-        ntk_hist_ps = sorted(set(snapped))
 
     with PdfPages(path) as pdf:
         for model_type in model_types:
@@ -339,87 +312,6 @@ def write_summary_pdf(
             pdf.savefig(fig)
             plt.close(fig)
 
-            if sub["mean_ntk_rank"].notna().any():
-                fig, axes = plt.subplots(1, n, figsize=(4 * n, 3), sharey=True)
-                if n == 1:
-                    axes = [axes]
-                for ax, act in zip(axes, activations):
-                    for width in widths:
-                        d = sub[(sub["activation"] == act) & (sub["mlp_width"] == width)].sort_values(
-                            sweep_label
-                        )
-                        ax.errorbar(
-                            d[sweep_label],
-                            d["mean_ntk_rank"],
-                            yerr=d["stderr_ntk_rank"],
-                            marker="o",
-                            label=f"w={width}",
-                        )
-                    ax.set_title(f"{model_type} / {act}")
-                    ax.set_xlabel(sweep_label)
-                    ax.grid(True, alpha=0.3)
-                axes[0].set_ylabel("mean NTK effective rank")
-                axes[0].legend(fontsize=8)
-                plt.tight_layout()
-                pdf.savefig(fig)
-                plt.close(fig)
-
-            if sub["mean_ntk_entropy"].notna().any():
-                fig, axes = plt.subplots(1, n, figsize=(4 * n, 3), sharey=True)
-                if n == 1:
-                    axes = [axes]
-                for ax, act in zip(axes, activations):
-                    for width in widths:
-                        d = sub[(sub["activation"] == act) & (sub["mlp_width"] == width)].sort_values(
-                            sweep_label
-                        )
-                        ax.errorbar(
-                            d[sweep_label],
-                            d["mean_ntk_entropy"],
-                            yerr=d["stderr_ntk_entropy"],
-                            marker="o",
-                            label=f"w={width}",
-                        )
-                    ax.set_title(f"{model_type} / {act}")
-                    ax.set_xlabel(sweep_label)
-                    ax.grid(True, alpha=0.3)
-                axes[0].set_ylabel("mean NTK spectral entropy")
-                axes[0].legend(fontsize=8)
-                plt.tight_layout()
-                pdf.savefig(fig)
-                plt.close(fig)
-
-            if not raw_df.empty and "ntk_eigvals" in raw_df.columns:
-                for act in activations:
-                    fig, axes = plt.subplots(1, len(ntk_hist_ps), figsize=(4 * len(ntk_hist_ps), 3), sharey=True)
-                    if len(ntk_hist_ps) == 1:
-                        axes = [axes]
-                    for ax, p_val in zip(axes, ntk_hist_ps):
-                        for width in widths:
-                            mask = (
-                                (raw_df["activation"] == act)
-                                & (raw_df["mlp_hidden_sizes"].apply(lambda x: x[0] if isinstance(x, list) else -1) == width)
-                                & (raw_df["p"] == p_val)
-                            )
-                            eigvals_list = raw_df.loc[mask, "ntk_eigvals"].dropna().tolist()
-                            if not eigvals_list:
-                                continue
-                            pooled = np.concatenate([np.array(ev, dtype=float) for ev in eigvals_list])
-                            pooled = np.maximum(pooled, 0.0)
-                            total = pooled.sum()
-                            pooled = pooled / total if total > 0 else pooled
-                            counts, bins = np.histogram(pooled, bins=30, density=True)
-                            centers = 0.5 * (bins[:-1] + bins[1:])
-                            ax.plot(centers, counts, label=f"w={width}")
-                        ax.set_title(f"{act} p={p_val:.2f}")
-                        ax.set_xlabel("eigenvalue")
-                        ax.grid(True, alpha=0.3)
-                    axes[0].set_ylabel("density")
-                    axes[0].legend(fontsize=8)
-                    plt.tight_layout()
-                    pdf.savefig(fig)
-                    plt.close(fig)
-
             # Finite-size scaling collapse for each activation.
             fss_results = {}
             for act in activations:
@@ -444,6 +336,9 @@ def build_cache_key(
     repeats: int,
     epochs: int,
     test_fraction: float,
+    exact_sample_counts: bool,
+    exact_train_samples: int | None,
+    exact_test_samples: int | None,
     loss_type: str,
     corruption_mode: str,
     ps: list[float],
@@ -458,8 +353,12 @@ def build_cache_key(
         s_min, s_max = min(sigmas), max(sigmas)
         strength_tag = f"s{s_min:.2f}-{s_max:.2f}"
     w_min, w_max = min(widths), max(widths)
+    if exact_sample_counts:
+        split_tag = f"ntr{int(exact_train_samples or 0)}_nte{int(exact_test_samples or 0)}"
+    else:
+        split_tag = f"tf{test_fraction:.3f}"
     return (
-        f"mlpws_r{repeats}_e{epochs}_tf{test_fraction:.3f}_"
+        f"mlpws_r{repeats}_e{epochs}_{split_tag}_"
         f"{strength_tag}_w{w_min}-{w_max}_d{mlp_depth}_loss-{loss_type}"
     )
 
@@ -470,11 +369,11 @@ def main() -> None:
     activations = ["relu"]
     model_types = ["mlp"]  # width sweep is MLP-only
     corruption_mode = "replacement"  # options: "replacement", "additive"
-    ps = np.linspace(0.9, 1.0, 51)
+    ps = np.linspace(0.9, 1.0, 11)
     sigmas = [0.0, 0.1, 0.2, 0.4, 0.6, 0.8, 1.0]
     widths = [128, 256, 512, 1024]
     mlp_depth = 1
-    repeats = 100
+    repeats = 10
     epochs = 20
     batch_size = 128
     learning_rate = 1e-3
@@ -486,26 +385,25 @@ def main() -> None:
     cpu_threads_per_worker = 1
     cpu_cores = list(range(cpu_max))  # Example: [0, 1, 2, 3] to pin processes.
     brightness_scale = 1.0
-    ntk_compute = False
-    ntk_subset_size = 64
-    ntk_output = "true"  # options: "true", "all"
-    ntk_use_corrupted_inputs = True
-    ntk_seed = 1234
-    ntk_hist_ps = [0, 0.5, 0.7, 0.8, 0.9, 0.92, 0.94, 0.96, 0.98, 1.0]
-    ntk_hist_tol = 1e-3
-    ntk_show_progress = True
     custom_split = False
     test_fraction = 1/2
     split_seed = 1234
     split_source = "train"
+    exact_sample_counts = True
+    exact_train_samples = 2048
+    exact_test_samples = 2048
     output_dir = "results"
-    suffix = "width_sweep_relu_only"
+    suffix = "width_sweep_relu_only_ntrain=ntest=2048"
     seed = 1234
     max_train_samples = None
     use_cuda = False
 
     if use_cuda and max_workers > 1:
         raise ValueError("use_cuda=True only supports max_workers=1 for now.")
+    if exact_sample_counts and (not exact_train_samples or not exact_test_samples):
+        raise ValueError(
+            "Set exact_train_samples and exact_test_samples to positive integers when exact_sample_counts=True."
+        )
 
     os.environ.setdefault("OMP_NUM_THREADS", str(cpu_threads_per_worker))
     os.environ.setdefault("MKL_NUM_THREADS", str(cpu_threads_per_worker))
@@ -541,12 +439,6 @@ def main() -> None:
                                 learning_rate=learning_rate,
                                 weight_decay=weight_decay,
                                 loss_type=loss_type,
-                                ntk_compute=ntk_compute,
-                                ntk_subset_size=ntk_subset_size,
-                                ntk_output=ntk_output,
-                                ntk_use_corrupted_inputs=ntk_use_corrupted_inputs,
-                                ntk_seed=ntk_seed,
-                                ntk_show_progress=ntk_show_progress,
                                 seed=run_seed,
                                 num_workers=data_workers,
                                 cpu_threads=cpu_threads_per_worker,
@@ -555,6 +447,9 @@ def main() -> None:
                                 test_fraction=test_fraction,
                                 split_seed=split_seed,
                                 split_source=split_source,
+                                exact_sample_counts=exact_sample_counts,
+                                exact_train_samples=exact_train_samples,
+                                exact_test_samples=exact_test_samples,
                                 max_train_samples=max_train_samples,
                                 use_cuda=use_cuda,
                             )
@@ -612,6 +507,9 @@ def main() -> None:
         repeats=repeats,
         epochs=epochs,
         test_fraction=test_fraction,
+        exact_sample_counts=exact_sample_counts,
+        exact_train_samples=exact_train_samples,
+        exact_test_samples=exact_test_samples,
         loss_type=loss_type,
         corruption_mode=corruption_mode,
         ps=ps,
@@ -627,7 +525,6 @@ def main() -> None:
     write_csv(summary_path, summary_rows)
 
     pdf_path = os.path.join(output_dir, f"accuracy_vs_{cache_key}{suffix_tag}.pdf")
-    ntk_npz_path = os.path.join(output_dir, f"ntk_eigvals_{cache_key}{suffix_tag}.npz")
     metadata = {
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "activations": activations,
@@ -643,14 +540,6 @@ def main() -> None:
         "learning_rate": learning_rate,
         "weight_decay": weight_decay,
         "loss_type": loss_type,
-        "ntk_compute": ntk_compute,
-        "ntk_subset_size": ntk_subset_size,
-        "ntk_output": ntk_output,
-        "ntk_use_corrupted_inputs": ntk_use_corrupted_inputs,
-        "ntk_seed": ntk_seed,
-        "ntk_hist_ps": ntk_hist_ps,
-        "ntk_hist_tol": ntk_hist_tol,
-        "ntk_show_progress": ntk_show_progress,
         "max_workers": max_workers,
         "max_in_flight": max_in_flight,
         "data_workers": data_workers,
@@ -661,35 +550,22 @@ def main() -> None:
         "test_fraction": test_fraction,
         "split_seed": split_seed,
         "split_source": split_source,
+        "exact_sample_counts": exact_sample_counts,
+        "exact_train_samples": exact_train_samples,
+        "exact_test_samples": exact_test_samples,
         "output_dir": output_dir,
         "seed": seed,
         "max_train_samples": max_train_samples,
         "use_cuda": use_cuda,
         "total_runs": len(configs),
     }
-    write_summary_pdf(pdf_path, summary_rows, results, metadata, ntk_hist_ps)
-
-    if ntk_compute:
-        eig_rows = [r for r in results if r.get("ntk_eigvals") is not None]
-        if eig_rows:
-            np.savez(
-                ntk_npz_path,
-                eigvals=np.array([r["ntk_eigvals"] for r in eig_rows], dtype=object),
-                p=np.array([r["p"] for r in eig_rows], dtype=float),
-                activation=np.array([r["activation"] for r in eig_rows], dtype=object),
-                width=np.array(
-                    [r["mlp_hidden_sizes"][0] if r.get("mlp_hidden_sizes") else -1 for r in eig_rows],
-                    dtype=int,
-                ),
-            )
+    write_summary_pdf(pdf_path, summary_rows, metadata)
 
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{timestamp}] Saved:")
     print(f"  {per_run_path}")
     print(f"  {summary_path}")
     print(f"  {pdf_path}")
-    if ntk_compute and os.path.exists(ntk_npz_path):
-        print(f"  {ntk_npz_path}")
     elapsed = datetime.now() - start_time
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Elapsed: {elapsed}")
     script_name = os.path.splitext(os.path.basename(__file__))[0]

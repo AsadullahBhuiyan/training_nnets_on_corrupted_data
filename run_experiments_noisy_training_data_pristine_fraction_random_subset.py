@@ -370,7 +370,7 @@ def write_summary_pdf(path: str, summary_rows: list[dict]) -> None:
 def main() -> None:
     start_time = datetime.now()
     # Manual configuration (edit these values directly).
-    activations = ["relu", "tanh", "linear", "quadratic"]
+    activations = ["relu"]
     model_types = ["mlp"]
     pristine_fracs = [0.0, 0.01, 0.05, 0.1]  # fraction of clean training data
     corruption_mode = "replacement"  # options: "replacement", "additive"
@@ -388,13 +388,13 @@ def main() -> None:
     split_seed = 1234
     cpu_max = 20
     max_workers = cpu_max
-    max_in_flight = max(1, cpu_max//2)
+    max_in_flight = max(1, 9*cpu_max//10)
     data_workers = 0
     cpu_threads_per_worker = 1
     cpu_cores = list(range(100, 100 + cpu_max))  # e.g., use cores 100-119 if cpu_max=20
     brightness_scale = 1.0
     output_dir = "results"
-    suffix = "pristine_fraction_random_subset"
+    suffix = "pristine_fraction_random_subset_relu_only"
     seed = 1234
     max_train_samples = None
     use_cuda = False
